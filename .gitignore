@@ -1,5 +1,10 @@
 # DeepChess
-checkpoints/
+checkpoints/*
+!checkpoints/.gitkeep
+
+# Compiled C++ extension
+src/_ext/*.so
+build/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

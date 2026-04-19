@@ -20,10 +20,11 @@ import time
 import chess
 import torch
 
-from board_utils import encode_board
-from model import ChessNet
-from mcts import MCTS
-from engine import _ClassicalEngine, get_device
+from .board_utils import encode_board
+from .model import ChessNet
+from .mcts import MCTS
+from .engine import _ClassicalEngine, get_device
+from .paths import CHECKPOINTS_DIR
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -192,7 +193,7 @@ def neural_eval(model, device, fen):
 	board = chess.Board(fen)
 	state = encode_board(board)
 	with torch.no_grad():
-		t = torch.FloatTensor(state).unsqueeze(0).to(device)
+		t = torch.from_numpy(state).unsqueeze(0).to(device)
 		_, v = model(t)
 	return v.item()
 
@@ -417,9 +418,10 @@ def main():
 		description="DeepChess — ground-truth validation",
 		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 	)
-	ap.add_argument("--checkpoint", default="checkpoints/latest.pt",
+	ap.add_argument("--checkpoint",
+	                default=os.path.join(CHECKPOINTS_DIR, "latest.pt"),
 	                help="Path to model checkpoint")
-	ap.add_argument("--checkpoint-dir", default="checkpoints",
+	ap.add_argument("--checkpoint-dir", default=CHECKPOINTS_DIR,
 	                help="Directory with numbered checkpoints (for --history)")
 	ap.add_argument("--simulations", type=int, default=200,
 	                help="MCTS simulations per test position")

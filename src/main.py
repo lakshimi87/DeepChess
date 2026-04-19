@@ -2,7 +2,7 @@
 """DeepChess — pygame-ce GUI.
 
 Usage:
-    python main.py --difficulty normal
+    python -m src.main --difficulty normal
     ./play.sh easy
 """
 
@@ -14,7 +14,8 @@ import threading
 import chess
 import pygame
 
-from engine import Engine
+from .engine import Engine
+from .paths import RESOURCES_DIR
 
 # ---------------------------------------------------------------------------
 # Layout constants
@@ -85,7 +86,6 @@ class ChessGame:
 	# ------------------------------------------------------------------
 
 	def _load_pieces(self):
-		res_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")
 		mapping = {
 			(chess.PAWN, chess.WHITE): "w_Pawn.png",
 			(chess.KNIGHT, chess.WHITE): "w_Knight.png",
@@ -101,7 +101,7 @@ class ChessGame:
 			(chess.KING, chess.BLACK): "b_King.png",
 		}
 		for key, fname in mapping.items():
-			img = pygame.image.load(os.path.join(res_dir, fname))
+			img = pygame.image.load(os.path.join(RESOURCES_DIR, fname))
 			self.pieces[key] = pygame.transform.smoothscale(img, (SQUARE_SIZE, SQUARE_SIZE))
 
 	# ------------------------------------------------------------------

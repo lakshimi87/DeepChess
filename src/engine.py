@@ -5,8 +5,9 @@ import os
 import chess
 import torch
 
-from model import ChessNet
-from mcts import MCTS
+from .model import ChessNet
+from .mcts import MCTS
+from .paths import CHECKPOINTS_DIR
 
 # ---------------------------------------------------------------------------
 # Difficulty presets
@@ -33,10 +34,12 @@ class Engine:
 	"""Unified interface: loads NN+MCTS when a checkpoint is found,
 	otherwise falls back to the classical engine."""
 
-	def __init__(self, difficulty="normal", checkpoint_dir="checkpoints"):
+	def __init__(self, difficulty="normal", checkpoint_dir=None):
 		self.difficulty = difficulty
 		self.device = get_device()
 
+		if checkpoint_dir is None:
+			checkpoint_dir = CHECKPOINTS_DIR
 		checkpoint_path = os.path.join(checkpoint_dir, "latest.pt")
 		if os.path.exists(checkpoint_path):
 			self.mode = "neural"

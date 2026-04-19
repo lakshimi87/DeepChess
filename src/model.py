@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from board_utils import NUM_MOVES
+from .board_utils import NUM_MOVES
 
 
 class ResidualBlock(nn.Module):

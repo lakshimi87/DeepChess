@@ -9,6 +9,9 @@ and a classical minimax fallback engine.
   with policy + value heads, guided by Monte Carlo Tree Search (MCTS)
 - **Classical engine** — minimax with alpha-beta pruning, quiescence search,
   and piece-square tables (available immediately, no training required)
+- **Native C++ acceleration** — hot-path routines (board encoding, move
+  indexing, PUCT selection) compiled via pybind11; pure-Python fallback
+  when the extension isn't built
 - **Three difficulty levels** — easy / normal / hard
 - **Self-play training** — run `train.sh` repeatedly to strengthen the neural
   engine; each run resumes from the latest checkpoint
@@ -18,7 +21,7 @@ and a classical minimax fallback engine.
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
+# 1. Install dependencies and build the C++ extension
 ./setup.sh
 
 # 2. Play (uses classical engine until you train a model)
@@ -31,6 +34,12 @@ and a classical minimax fallback engine.
 ./train.sh --iterations 50 --simulations 400
 ```
 
+If you ever need to rebuild the native extension by itself:
+
+```bash
+./build_ext.sh
+```
+
 ## Training
 
 Each invocation of `train.sh` loads the latest checkpoint from `checkpoints/`
@@ -38,7 +47,8 @@ and continues training.  Interrupt with Ctrl-C at any time — the current
 progress is saved automatically.
 
 ```bash
-# Defaults: 100 iterations, 10 games/iter, 200 MCTS sims/move
+# Defaults: 100 iterations, 10 games/iter, 200 MCTS sims/move,
+# numbered snapshot every 10 iterations
 ./train.sh
 
 # Customise anything
@@ -47,13 +57,17 @@ progress is saved automatically.
            --simulations 400 \
            --batch-size 128 \
            --epochs 10 \
-           --lr 0.001
+           --lr 0.001 \
+           --checkpoint-every 5
 
 # See all options
-python train.py --help
+python -m src.train --help
 ```
 
-After training, `play.sh` automatically picks up the neural engine.
+`latest.pt` is refreshed every iteration so `play.sh` always picks up the
+newest weights.  `model_iter_XXXX.pt` snapshots are only written every
+`--checkpoint-every` iterations (default: 10) to keep disk usage bounded —
+plus one final snapshot on the last iteration and on interrupt.
 
 ## Validation
 
@@ -86,13 +100,19 @@ for comparison.
 ## Project Structure
 
 ```
-board_utils.py   Board encoding (18x8x8) and move indexing (4672 moves)
-model.py         ChessNet — dual-head ResNet (policy + value)
-mcts.py          Monte Carlo Tree Search with PUCT selection
-engine.py        Unified engine (neural MCTS or classical minimax)
-train.py         Self-play training pipeline with checkpointing
-validate_gt.py   Ground truth validation (20 curated test positions)
-main.py          pygame-ce GUI
-resources/       Chess piece images
-checkpoints/     Saved model weights (created by train.sh)
+src/
+  board_utils.py   Board encoding (18x8x8) and move indexing (4672 moves)
+  model.py         ChessNet — dual-head ResNet (policy + value)
+  mcts.py          Monte Carlo Tree Search with PUCT selection
+  engine.py        Unified engine (neural MCTS or classical minimax)
+  train.py         Self-play training pipeline with checkpointing
+  validate_gt.py   Ground truth validation (20 curated test positions)
+  main.py          pygame-ce GUI
+  paths.py         Project-root-relative path constants
+  _ext/            Native C++ extension (pybind11) + loader
+
+setup.py           setuptools build script for the C++ extension
+build_ext.sh       One-shot wrapper to (re)build the extension
+resources/         Chess piece images
+checkpoints/       Saved model weights (created by setup.sh)
 ```

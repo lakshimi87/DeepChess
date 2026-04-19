@@ -23,9 +23,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from board_utils import encode_board, NUM_MOVES
-from model import ChessNet
-from mcts import MCTS
+from . import _ext
+from .board_utils import encode_board, NUM_MOVES
+from .model import ChessNet
+from .mcts import MCTS
+from .paths import CHECKPOINTS_DIR
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -40,7 +42,14 @@ def get_device():
 
 
 def save_checkpoint(model, optimizer, iteration, checkpoint_dir,
-                    num_res_blocks, num_filters):
+                    num_res_blocks, num_filters, numbered=True):
+	"""Write ``latest.pt`` and (optionally) ``model_iter_XXXX.pt``.
+
+	``latest.pt`` is always refreshed so play.sh/resume always see the most
+	recent weights.  ``numbered`` controls whether a permanent snapshot is
+	also emitted — the training loop only does this every N iterations to
+	keep disk usage bounded.
+	"""
 	os.makedirs(checkpoint_dir, exist_ok=True)
 	payload = {
 		"model_state_dict": model.state_dict(),
@@ -49,12 +58,11 @@ def save_checkpoint(model, optimizer, iteration, checkpoint_dir,
 		"num_res_blocks": num_res_blocks,
 		"num_filters": num_filters,
 	}
-	# Numbered checkpoint
-	numbered = os.path.join(checkpoint_dir, f"model_iter_{iteration:04d}.pt")
-	torch.save(payload, numbered)
-	# Overwrite 'latest' so play.sh can always find the newest model
 	latest = os.path.join(checkpoint_dir, "latest.pt")
 	torch.save(payload, latest)
+	if numbered:
+		numbered_path = os.path.join(checkpoint_dir, f"model_iter_{iteration:04d}.pt")
+		torch.save(payload, numbered_path)
 
 
 # ---------------------------------------------------------------------------
@@ -183,16 +191,25 @@ def main():
 	                    help="Weight decay (L2 regularisation)")
 	parser.add_argument("--buffer-size", type=int, default=50000,
 	                    help="Replay buffer capacity (positions)")
-	parser.add_argument("--checkpoint-dir", type=str, default="checkpoints",
+	parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINTS_DIR,
 	                    help="Directory for model checkpoints")
+	parser.add_argument("--checkpoint-every", type=int, default=10,
+	                    help="Write a numbered checkpoint every N iterations "
+	                         "(latest.pt is refreshed every iteration)")
 	parser.add_argument("--res-blocks", type=int, default=10,
 	                    help="Residual blocks in the network")
 	parser.add_argument("--filters", type=int, default=128,
 	                    help="Convolutional filters per layer")
 	args = parser.parse_args()
 
+	# Always make sure the checkpoint directory exists.
+	os.makedirs(args.checkpoint_dir, exist_ok=True)
+
 	device = get_device()
-	print(f"Device: {device}")
+	print(f"Device          : {device}")
+	print(f"Native ext      : {'yes' if _ext.AVAILABLE else 'no (pure-Python)'}")
+	print(f"Checkpoint dir  : {args.checkpoint_dir}")
+	print(f"Checkpoint every: {args.checkpoint_every} iteration(s)")
 
 	# ---- model & optimiser ----
 	model = ChessNet(num_res_blocks=args.res_blocks, num_filters=args.filters)
@@ -244,6 +261,7 @@ def main():
 
 	# ---- training loop ----
 	end_iter = start_iter + args.iterations
+	iteration = start_iter
 	for iteration in range(start_iter, end_iter):
 		if interrupted:
 			break
@@ -293,17 +311,28 @@ def main():
 			print(f"  Trained in {elapsed:.1f}s")
 
 		# -- checkpoint --
-		save_checkpoint(
-			model, optimizer, iteration + 1, args.checkpoint_dir,
-			args.res_blocks, args.filters,
+		# Always refresh latest.pt; keep a numbered snapshot only every
+		# checkpoint-every iterations (plus the final iteration so nothing
+		# is lost at the end of a run).
+		iter_num = iteration + 1
+		keep_numbered = (
+			args.checkpoint_every > 0 and
+			(iter_num % args.checkpoint_every == 0 or iter_num == end_iter)
 		)
-		print(f"Checkpoint saved  (iteration {iteration + 1})")
+		save_checkpoint(
+			model, optimizer, iter_num, args.checkpoint_dir,
+			args.res_blocks, args.filters, numbered=keep_numbered,
+		)
+		if keep_numbered:
+			print(f"Checkpoint saved  (iteration {iter_num}, snapshot kept)")
+		else:
+			print(f"Checkpoint saved  (iteration {iter_num}, latest only)")
 
-	# Final save on interrupt
+	# Final save on interrupt (always numbered so work isn't lost).
 	if interrupted:
 		save_checkpoint(
 			model, optimizer, iteration + 1, args.checkpoint_dir,
-			args.res_blocks, args.filters,
+			args.res_blocks, args.filters, numbered=True,
 		)
 		print(f"Emergency checkpoint saved  (iteration {iteration + 1})")
 
