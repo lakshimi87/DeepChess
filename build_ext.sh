@@ -3,9 +3,7 @@
 set -e
 cd "$(dirname "$0")"
 
-if [ -d .venv ]; then
-	source .venv/bin/activate
-fi
+source "$HOME/venvs/torch/bin/activate"
 
 python -m pip install --quiet pybind11
 python setup.py build_ext --inplace

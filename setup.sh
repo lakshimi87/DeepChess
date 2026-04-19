@@ -3,13 +3,28 @@ set -e
 cd "$(dirname "$0")"
 
 echo "=== DeepChess Setup ==="
+VENV_DIR="$HOME/venvs/torch"
 
-# Create virtual environment
-python3 -m venv .venv
-echo "Virtual environment created."
+if [ -d "$VENV_DIR" ]; then
+    echo "venv already exists at $VENV_DIR"
+    read -p "Recreate? [y/N] " ans
+    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+        rm -rf "$VENV_DIR"
+    else
+        echo "Skipping venv creation. Installing packages into existing venv..."
+        source "$VENV_DIR/bin/activate"
+        pip install --upgrade pip
+        pip install torch numpy pygame-ce
+        echo "Done!"
+        exit 0
+    fi
+fi
 
-# Activate
-source .venv/bin/activate
+echo "Creating virtual environment at $VENV_DIR ..."
+mkdir -p "$(dirname "$VENV_DIR")"
+python3 -m venv "$VENV_DIR"
+
+source "$VENV_DIR/bin/activate"
 
 # Upgrade pip
 pip install --upgrade pip
