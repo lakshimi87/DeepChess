@@ -51,7 +51,8 @@ class Engine:
 			self.model.to(self.device)
 			self.model.eval()
 			sims = NEURAL_SIMULATIONS.get(difficulty, 400)
-			self.mcts = MCTS(self.model, self.device, num_simulations=sims)
+			self.mcts = MCTS(self.model, self.device, num_simulations=sims,
+			                 batch_size=16)
 		else:
 			self.mode = "classical"
 			self._classical = _ClassicalEngine(

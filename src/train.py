@@ -69,13 +69,14 @@ def save_checkpoint(model, optimizer, iteration, checkpoint_dir,
 # Self-play
 # ---------------------------------------------------------------------------
 
-def play_game(model, device, num_simulations=200, max_moves=512):
+def play_game(model, device, num_simulations=200, max_moves=512, mcts_batch=16):
 	"""Play one self-play game and return training examples.
 
 	Returns a list of (state, policy_target, value_target) tuples.
 	"""
 	board = chess.Board()
-	mcts = MCTS(model, device, num_simulations=num_simulations)
+	mcts = MCTS(model, device, num_simulations=num_simulations,
+	            batch_size=mcts_batch)
 	history = []  # (encoded_state, policy, turn)
 
 	move_count = 0
@@ -179,6 +180,10 @@ def main():
 	                    help="Self-play games per iteration")
 	parser.add_argument("--simulations", type=int, default=200,
 	                    help="MCTS simulations per move during self-play")
+	parser.add_argument("--mcts-batch", type=int, default=16,
+	                    help="MCTS leaf batch size (virtual-loss parallelism). "
+	                         "Higher = fewer NN forward passes but less tree "
+	                         "diversity.  8–32 is a good range.")
 	parser.add_argument("--max-moves", type=int, default=512,
 	                    help="Maximum moves per self-play game")
 	parser.add_argument("--batch-size", type=int, default=256,
@@ -282,6 +287,7 @@ def main():
 				model, device,
 				num_simulations=args.simulations,
 				max_moves=args.max_moves,
+				mcts_batch=args.mcts_batch,
 			)
 			iter_examples.extend(examples)
 			print(f"  Game {g + 1:>{len(str(args.games_per_iter))}}"

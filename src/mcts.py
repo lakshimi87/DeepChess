@@ -34,14 +34,19 @@ class MCTS:
 	"""Monte Carlo Tree Search guided by a neural network.
 
 	Uses PUCT for tree traversal and a dual-head NN (policy + value)
-	for leaf evaluation and move priors.
+	for leaf evaluation and move priors.  When *batch_size* > 1 the search
+	descends to *batch_size* leaves under virtual loss and evaluates them
+	with a single NN forward pass — dramatically cutting per-simulation
+	dispatch overhead on GPU / MPS.
 	"""
 
-	def __init__(self, model, device, num_simulations=800, c_puct=1.5):
+	def __init__(self, model, device, num_simulations=800, c_puct=1.5,
+	             batch_size=1):
 		self.model = model
 		self.device = device
 		self.num_simulations = num_simulations
 		self.c_puct = c_puct
+		self.batch_size = max(1, int(batch_size))
 		self._use_ext = _ext.AVAILABLE
 
 	# ------------------------------------------------------------------
@@ -61,6 +66,19 @@ class MCTS:
 		policy_logits, value = self.model(tensor)
 		policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
 		return policy, value.item()
+
+	@torch.no_grad()
+	def evaluate_batch(self, boards):
+		"""Run the NN on a list of boards and return (policies, values).
+
+		*policies* is a numpy array (B, NUM_MOVES); *values* is (B,).
+		"""
+		states = np.stack([encode_board(b) for b in boards])
+		tensor = torch.from_numpy(states).to(self.device)
+		policy_logits, values = self.model(tensor)
+		policies = torch.softmax(policy_logits, dim=1).cpu().numpy()
+		values_np = values.squeeze(-1).cpu().numpy()
+		return policies, values_np
 
 	# ------------------------------------------------------------------
 	# Tree operations
@@ -125,7 +143,7 @@ class MCTS:
 
 		root = MCTSNode()
 
-		# Expand root
+		# Expand root (single NN call — only once per search).
 		policy, _ = self.evaluate(board)
 		legal_moves, indices = get_legal_move_indices(board)
 
@@ -138,37 +156,76 @@ class MCTS:
 		self._expand(root, policy, legal_moves, indices, add_noise=add_noise)
 		root_indices = list(indices)
 
-		# ----- simulations -----
-		for _ in range(self.num_simulations):
-			node = root
-			scratch = board.copy()
-			path = []  # list[(parent_node, child_idx)]
+		# ----- simulations (batched with virtual loss when batch_size>1) -----
+		sims_done = 0
+		while sims_done < self.num_simulations:
+			this_batch = min(self.batch_size, self.num_simulations - sims_done)
 
-			# Selection — walk existing tree
-			while node.expanded and not scratch.is_game_over():
-				idx = self._select_child(node)
-				scratch.push(node.moves[idx])
-				path.append((node, idx))
-				child = node.children_nodes[idx]
-				if child is None:
-					child = MCTSNode()
-					node.children_nodes[idx] = child
-				node = child
+			# Phase 1 — descent: pick `this_batch` leaves.  Virtual loss
+			# (+1 to visits, +1 to total_values) applied at every edge
+			# traversed so that subsequent descents within this batch
+			# are pushed toward different paths.
+			paths = []
+			leaf_nodes = []
+			leaf_boards = []
+			leaf_terminal_values = []  # None if non-terminal, else float
 
-			# Leaf evaluation
-			if scratch.is_game_over():
-				value = -1.0 if scratch.is_checkmate() else 0.0
-			else:
-				leaf_policy, value = self.evaluate(scratch)
-				leaf_legal, leaf_idx = get_legal_move_indices(scratch)
-				if leaf_legal:
-					self._expand(node, leaf_policy, leaf_legal, leaf_idx)
+			for _ in range(this_batch):
+				node = root
+				scratch = board.copy()
+				path = []
+				while node.expanded and not scratch.is_game_over():
+					idx = self._select_child(node)
+					node.visits[idx] += 1
+					node.total_values[idx] += 1.0  # virtual loss
+					scratch.push(node.moves[idx])
+					path.append((node, idx))
+					child = node.children_nodes[idx]
+					if child is None:
+						child = MCTSNode()
+						node.children_nodes[idx] = child
+					node = child
 
-			# Backpropagation (flip sign at each level)
-			for parent, idx in reversed(path):
-				parent.visits[idx] += 1
-				parent.total_values[idx] += value
-				value = -value
+				paths.append(path)
+				if scratch.is_game_over():
+					value = -1.0 if scratch.is_checkmate() else 0.0
+					leaf_nodes.append(None)
+					leaf_boards.append(None)
+					leaf_terminal_values.append(value)
+				else:
+					leaf_nodes.append(node)
+					leaf_boards.append(scratch)
+					leaf_terminal_values.append(None)
+
+			# Phase 2 — batched NN evaluation for non-terminal leaves.
+			nn_idx = [i for i, v in enumerate(leaf_terminal_values) if v is None]
+			if nn_idx:
+				boards_to_eval = [leaf_boards[i] for i in nn_idx]
+				if len(boards_to_eval) == 1:
+					pol, val = self.evaluate(boards_to_eval[0])
+					policies = pol[None, :]
+					values_np = np.array([val], dtype=np.float32)
+				else:
+					policies, values_np = self.evaluate_batch(boards_to_eval)
+
+				for bidx, i in enumerate(nn_idx):
+					leaf_node = leaf_nodes[i]
+					# Expand the leaf (skip if an earlier batch entry already did).
+					if not leaf_node.expanded:
+						leaf_legal, leaf_idx = get_legal_move_indices(leaf_boards[i])
+						if leaf_legal:
+							self._expand(leaf_node, policies[bidx], leaf_legal, leaf_idx)
+					leaf_terminal_values[i] = float(values_np[bidx])
+
+			# Phase 3 — backprop: remove virtual loss and apply real value.
+			for path, value in zip(paths, leaf_terminal_values):
+				for parent, idx in reversed(path):
+					parent.total_values[idx] -= 1.0  # undo virtual loss
+					parent.total_values[idx] += value
+					# visits were already incremented during descent
+					value = -value
+
+			sims_done += this_batch
 
 		# ----- build policy target from visit counts -----
 		policy_target = np.zeros(NUM_MOVES, dtype=np.float32)
