@@ -41,7 +41,7 @@ def get_device():
 	return torch.device("cpu")
 
 
-def save_checkpoint(model, optimizer, iteration, checkpoint_dir,
+def save_checkpoint(model, optimizer, scheduler, iteration, checkpoint_dir,
                     num_res_blocks, num_filters, numbered=True):
 	"""Write ``latest.pt`` and (optionally) ``model_iter_XXXX.pt``.
 
@@ -54,6 +54,7 @@ def save_checkpoint(model, optimizer, iteration, checkpoint_dir,
 	payload = {
 		"model_state_dict": model.state_dict(),
 		"optimizer_state_dict": optimizer.state_dict(),
+		"scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
 		"iteration": iteration,
 		"num_res_blocks": num_res_blocks,
 		"num_filters": num_filters,
@@ -69,10 +70,16 @@ def save_checkpoint(model, optimizer, iteration, checkpoint_dir,
 # Self-play
 # ---------------------------------------------------------------------------
 
-def play_game(model, device, num_simulations=200, max_moves=512, mcts_batch=16):
+def play_game(model, device, num_simulations=400, max_moves=512, mcts_batch=16,
+              value_discount=1.0):
 	"""Play one self-play game and return training examples.
 
 	Returns a list of (state, policy_target, value_target) tuples.
+
+	*value_discount* in (0, 1] applies ``discount ** (moves_until_end)`` to
+	each position's value target — so positions close to the decisive outcome
+	carry a stronger signal than those 200 moves earlier where the result is
+	far noisier.  Set to 1.0 to reproduce the AlphaZero paper exactly.
 	"""
 	board = chess.Board()
 	mcts = MCTS(model, device, num_simulations=num_simulations,
@@ -99,13 +106,17 @@ def play_game(model, device, num_simulations=200, max_moves=512, mcts_batch=16):
 		winner = None  # draw
 
 	examples = []
-	for state, policy, player in history:
+	total = len(history)
+	for i, (state, policy, player) in enumerate(history):
 		if winner is None:
 			value = 0.0
 		elif winner == player:
 			value = 1.0
 		else:
 			value = -1.0
+		if value_discount < 1.0:
+			moves_remaining = total - i
+			value *= value_discount ** moves_remaining
 		examples.append((state, policy, value))
 
 	return examples, board.result()
@@ -116,8 +127,14 @@ def play_game(model, device, num_simulations=200, max_moves=512, mcts_batch=16):
 # ---------------------------------------------------------------------------
 
 def train_on_data(model, optimizer, device, replay_buffer,
-                  batch_size=256, epochs=5):
-	"""Train model on the replay buffer for *epochs* full passes."""
+                  batch_size=256, epochs=5, value_weight=1.0):
+	"""Train model on the replay buffer for *epochs* full passes.
+
+	*value_weight* scales the MSE value loss relative to the cross-entropy
+	policy loss.  Policy logits span 4672 slots and typically produce losses
+	~2–5, while the value MSE is <= 1 — without up-weighting, the value head
+	barely sees any gradient.
+	"""
 	if len(replay_buffer) < batch_size:
 		return None
 
@@ -146,7 +163,7 @@ def train_on_data(model, optimizer, device, replay_buffer,
 
 			p_loss = -(b_policies * F.log_softmax(policy_logits, dim=1)).sum(dim=1).mean()
 			v_loss = F.mse_loss(pred_values.squeeze(-1), b_values)
-			loss = p_loss + v_loss
+			loss = p_loss + value_weight * v_loss
 
 			optimizer.zero_grad()
 			loss.backward()
@@ -161,7 +178,7 @@ def train_on_data(model, optimizer, device, replay_buffer,
 	return {
 		"policy_loss": total_p_loss / n_batches,
 		"value_loss": total_v_loss / n_batches,
-		"total_loss": (total_p_loss + total_v_loss) / n_batches,
+		"total_loss": (total_p_loss + value_weight * total_v_loss) / n_batches,
 	}
 
 
@@ -176,9 +193,9 @@ def main():
 	)
 	parser.add_argument("--iterations", type=int, default=100,
 	                    help="Number of train iterations to run")
-	parser.add_argument("--games-per-iter", type=int, default=10,
+	parser.add_argument("--games-per-iter", type=int, default=50,
 	                    help="Self-play games per iteration")
-	parser.add_argument("--simulations", type=int, default=200,
+	parser.add_argument("--simulations", type=int, default=400,
 	                    help="MCTS simulations per move during self-play")
 	parser.add_argument("--mcts-batch", type=int, default=16,
 	                    help="MCTS leaf batch size (virtual-loss parallelism). "
@@ -190,10 +207,27 @@ def main():
 	                    help="Training batch size")
 	parser.add_argument("--epochs", type=int, default=5,
 	                    help="Training epochs per iteration")
-	parser.add_argument("--lr", type=float, default=0.002,
-	                    help="Learning rate")
+	parser.add_argument("--lr", type=float, default=0.02,
+	                    help="Initial learning rate (SGD+momentum).  Stepped "
+	                         "down by --lr-gamma at each --lr-milestones.")
+	parser.add_argument("--lr-milestones", type=int, nargs="+",
+	                    default=[100, 300, 600],
+	                    help="Absolute iteration numbers at which to decay the "
+	                         "learning rate by --lr-gamma.")
+	parser.add_argument("--lr-gamma", type=float, default=0.1,
+	                    help="Multiplicative LR decay at each milestone.")
+	parser.add_argument("--momentum", type=float, default=0.9,
+	                    help="SGD momentum")
 	parser.add_argument("--weight-decay", type=float, default=1e-4,
 	                    help="Weight decay (L2 regularisation)")
+	parser.add_argument("--value-weight", type=float, default=1.0,
+	                    help="Weight applied to the MSE value loss when summed "
+	                         "with the policy cross-entropy.  Bump above 1.0 if "
+	                         "the value head still underfits.")
+	parser.add_argument("--value-discount", type=float, default=1.0,
+	                    help="Per-move discount applied to value targets "
+	                         "(1.0 = AlphaZero paper; <1 weakens early-game "
+	                         "signal where the game outcome is noisier).")
 	parser.add_argument("--buffer-size", type=int, default=50000,
 	                    help="Replay buffer capacity (positions)")
 	parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINTS_DIR,
@@ -205,6 +239,10 @@ def main():
 	                    help="Residual blocks in the network")
 	parser.add_argument("--filters", type=int, default=128,
 	                    help="Convolutional filters per layer")
+	parser.add_argument("--from-scratch", action="store_true",
+	                    help="Ignore any existing latest.pt and start fresh. "
+	                         "Use this after architecture changes so old "
+	                         "incompatible checkpoints don't block resume.")
 	args = parser.parse_args()
 
 	# Always make sure the checkpoint directory exists.
@@ -216,17 +254,31 @@ def main():
 	print(f"Checkpoint dir  : {args.checkpoint_dir}")
 	print(f"Checkpoint every: {args.checkpoint_every} iteration(s)")
 
+	def _build_optim_and_sched(model, last_iter):
+		opt = torch.optim.SGD(
+			model.parameters(),
+			lr=args.lr,
+			momentum=args.momentum,
+			nesterov=True,
+			weight_decay=args.weight_decay,
+		)
+		sched = torch.optim.lr_scheduler.MultiStepLR(
+			opt,
+			milestones=args.lr_milestones,
+			gamma=args.lr_gamma,
+			last_epoch=last_iter - 1 if last_iter > 0 else -1,
+		)
+		return opt, sched
+
 	# ---- model & optimiser ----
 	model = ChessNet(num_res_blocks=args.res_blocks, num_filters=args.filters)
 	model.to(device)
-	optimizer = torch.optim.Adam(
-		model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
-	)
+	optimizer, scheduler = _build_optim_and_sched(model, 0)
 
 	# ---- resume from checkpoint ----
 	start_iter = 0
 	latest_path = os.path.join(args.checkpoint_dir, "latest.pt")
-	if os.path.exists(latest_path):
+	if os.path.exists(latest_path) and not args.from_scratch:
 		ckpt = torch.load(latest_path, map_location=device, weights_only=False)
 		# Use architecture from checkpoint when resuming
 		saved_res = ckpt.get("num_res_blocks", args.res_blocks)
@@ -234,17 +286,39 @@ def main():
 		if saved_res != args.res_blocks or saved_fil != args.filters:
 			print(f"Checkpoint arch ({saved_res} blocks, {saved_fil} filters) "
 			      f"differs from args — using checkpoint arch.")
-			model = ChessNet(num_res_blocks=saved_res, num_filters=saved_fil)
-			model.to(device)
-			optimizer = torch.optim.Adam(
-				model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
-			)
 			args.res_blocks = saved_res
 			args.filters = saved_fil
-		model.load_state_dict(ckpt["model_state_dict"])
-		optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+			model = ChessNet(num_res_blocks=saved_res, num_filters=saved_fil)
+			model.to(device)
 		start_iter = ckpt.get("iteration", 0)
-		print(f"Resumed from iteration {start_iter}")
+		optimizer, scheduler = _build_optim_and_sched(model, start_iter)
+		try:
+			model.load_state_dict(ckpt["model_state_dict"])
+		except RuntimeError as e:
+			raise SystemExit(
+				f"\nCheckpoint at {latest_path} is incompatible with the current "
+				f"model definition (likely because the architecture changed — "
+				f"for example, NUM_PLANES or the value head).\n"
+				f"Re-run with --from-scratch, or move the old checkpoints aside.\n\n"
+				f"Underlying error:\n  {e}"
+			)
+		# Optimizer/scheduler state are only reloaded when the optimizer class
+		# itself matches — otherwise we silently start with fresh momentum.
+		try:
+			optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+		except (ValueError, KeyError):
+			print("Optimizer state incompatible with --optimizer choice — "
+			      "starting with a fresh optimizer.")
+		sched_state = ckpt.get("scheduler_state_dict")
+		if sched_state is not None:
+			try:
+				scheduler.load_state_dict(sched_state)
+			except Exception:
+				pass  # milestones may have changed; fall back to fresh schedule
+		print(f"Resumed from iteration {start_iter}  |  "
+		      f"lr={optimizer.param_groups[0]['lr']:.5f}")
+	elif args.from_scratch and os.path.exists(latest_path):
+		print("--from-scratch set — ignoring existing checkpoint.")
 	else:
 		print("No checkpoint found — starting from scratch.")
 
@@ -288,6 +362,7 @@ def main():
 				num_simulations=args.simulations,
 				max_moves=args.max_moves,
 				mcts_batch=args.mcts_batch,
+				value_discount=args.value_discount,
 			)
 			iter_examples.extend(examples)
 			print(f"  Game {g + 1:>{len(str(args.games_per_iter))}}"
@@ -303,11 +378,13 @@ def main():
 			break
 
 		# -- training --
-		print(f"Training: {args.epochs} epochs, batch {args.batch_size} …")
+		print(f"Training: {args.epochs} epochs, batch {args.batch_size}, "
+		      f"lr={optimizer.param_groups[0]['lr']:.5f} …")
 		t0 = time.time()
 		losses = train_on_data(
 			model, optimizer, device, replay_buffer,
 			batch_size=args.batch_size, epochs=args.epochs,
+			value_weight=args.value_weight,
 		)
 		elapsed = time.time() - t0
 		if losses:
@@ -315,6 +392,11 @@ def main():
 			print(f"  Value  loss : {losses['value_loss']:.4f}")
 			print(f"  Total  loss : {losses['total_loss']:.4f}")
 			print(f"  Trained in {elapsed:.1f}s")
+
+		# Step the LR scheduler once per iteration regardless of whether a
+		# training update happened — this keeps the schedule aligned with the
+		# iteration counter across resumes.
+		scheduler.step()
 
 		# -- checkpoint --
 		# Always refresh latest.pt; keep a numbered snapshot only every
@@ -326,7 +408,7 @@ def main():
 			(iter_num % args.checkpoint_every == 0 or iter_num == end_iter)
 		)
 		save_checkpoint(
-			model, optimizer, iter_num, args.checkpoint_dir,
+			model, optimizer, scheduler, iter_num, args.checkpoint_dir,
 			args.res_blocks, args.filters, numbered=keep_numbered,
 		)
 		if keep_numbered:
@@ -337,7 +419,7 @@ def main():
 	# Final save on interrupt (always numbered so work isn't lost).
 	if interrupted:
 		save_checkpoint(
-			model, optimizer, iteration + 1, args.checkpoint_dir,
+			model, optimizer, scheduler, iteration + 1, args.checkpoint_dir,
 			args.res_blocks, args.filters, numbered=True,
 		)
 		print(f"Emergency checkpoint saved  (iteration {iteration + 1})")

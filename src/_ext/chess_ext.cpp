@@ -1,23 +1,34 @@
 // DeepChess native acceleration.
 //
 // Implements the hot-path routines called during self-play and MCTS:
-//   * encode_board    — build the 18x8x8 float32 input tensor
+//   * encode_board    — build the 20x8x8 float32 input tensor
 //   * move_to_index   — map (from, to, promotion) -> AlphaZero-style policy slot
 //   * puct_select     — pick the argmax-PUCT child from parallel node arrays
 //
 // The goal is to eliminate per-node Python overhead in the MCTS inner loops;
 // these three functions dominate the profile before batching.
+//
+// IMPORTANT: the plane count and layout must match board_utils.NUM_PLANES /
+// _encode_board_py exactly — if you change one, change the other.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 
 namespace py = pybind11;
+
+// Must match board_utils.NUM_PLANES.
+static constexpr int NUM_PLANES = 20;
+// Normalisation divisors — must match _HALFMOVE_DIVISOR / _FULLMOVE_DIVISOR in
+// board_utils.py.
+static constexpr float HALFMOVE_DIVISOR = 100.0f;
+static constexpr float FULLMOVE_DIVISOR = 200.0f;
 
 // -----------------------------------------------------------------------------
 // Move encoding
@@ -118,13 +129,15 @@ static py::array_t<float> encode_board(
 	uint64_t pawns, uint64_t knights, uint64_t bishops,
 	uint64_t rooks, uint64_t queens, uint64_t kings,
 	bool w_kside, bool w_qside, bool b_kside, bool b_qside,
-	int ep_square
+	int ep_square,
+	int halfmove,
+	int fullmove
 ) {
-	py::array_t<float> arr({18, 8, 8});
+	py::array_t<float> arr({NUM_PLANES, 8, 8});
 	auto buf = arr.mutable_unchecked<3>();
 
 	// Zero-initialize (numpy allocated memory is not guaranteed to be zeroed).
-	std::memset(arr.mutable_data(), 0, sizeof(float) * 18 * 8 * 8);
+	std::memset(arr.mutable_data(), 0, sizeof(float) * NUM_PLANES * 8 * 8);
 
 	const uint64_t type_bb[6] = { pawns, knights, bishops, rooks, queens, kings };
 
@@ -148,16 +161,16 @@ static py::array_t<float> encode_board(
 		}
 	}
 
-	// Castling rights (binary planes).
-	auto fill_plane = [&](int p) {
+	// Castling rights / indicator / scalar clocks (all uniform over 8x8).
+	auto fill_plane_value = [&](int p, float v) {
 		for (int r = 0; r < 8; ++r)
 			for (int f = 0; f < 8; ++f)
-				buf(p, r, f) = 1.0f;
+				buf(p, r, f) = v;
 	};
-	if (w_kside) fill_plane(12);
-	if (w_qside) fill_plane(13);
-	if (b_kside) fill_plane(14);
-	if (b_qside) fill_plane(15);
+	if (w_kside) fill_plane_value(12, 1.0f);
+	if (w_qside) fill_plane_value(13, 1.0f);
+	if (b_kside) fill_plane_value(14, 1.0f);
+	if (b_qside) fill_plane_value(15, 1.0f);
 
 	// En passant square.
 	if (ep_square >= 0 && ep_square < 64) {
@@ -165,7 +178,15 @@ static py::array_t<float> encode_board(
 	}
 
 	// Current-player indicator plane (always 1 after mirroring).
-	fill_plane(17);
+	fill_plane_value(17, 1.0f);
+
+	// Progress / phase planes (scalar broadcast over 8x8).
+	float hm = std::min(halfmove, static_cast<int>(HALFMOVE_DIVISOR))
+	           / HALFMOVE_DIVISOR;
+	float fm = std::min(fullmove, static_cast<int>(FULLMOVE_DIVISOR))
+	           / FULLMOVE_DIVISOR;
+	fill_plane_value(18, hm);
+	fill_plane_value(19, fm);
 
 	return arr;
 }
@@ -224,8 +245,9 @@ PYBIND11_MODULE(chess_ext, m) {
 	      py::arg("w_kside"), py::arg("w_qside"),
 	      py::arg("b_kside"), py::arg("b_qside"),
 	      py::arg("ep_square"),
-	      "Build the 18x8x8 float32 input tensor from the mirrored board's "
-	      "bitboards.");
+	      py::arg("halfmove"), py::arg("fullmove"),
+	      "Build the 20x8x8 float32 input tensor from the mirrored board's "
+	      "bitboards (12 piece + 4 castling + 1 ep + 1 indicator + 2 clocks).");
 	m.def("puct_select", &puct_select,
 	      py::arg("priors"), py::arg("visits"), py::arg("total_values"),
 	      py::arg("c_puct"),

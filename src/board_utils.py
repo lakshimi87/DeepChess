@@ -10,6 +10,12 @@ import numpy as np
 from . import _ext
 
 NUM_MOVES = 4672  # 64 squares x 73 move types per square
+NUM_PLANES = 20   # 12 piece planes + 4 castling + 1 ep + 1 indicator + 2 clocks
+
+# Normalisation constants for the scalar-clock planes.  Values are clipped and
+# divided so the network sees a float in [0, 1].
+_HALFMOVE_DIVISOR = 100.0   # 50-move rule kicks in at 100 halfmoves
+_FULLMOVE_DIVISOR = 200.0   # games rarely exceed 200 fullmoves
 
 # Direction vectors for queen-like moves (8 directions)
 DIRECTIONS = [
@@ -119,10 +125,15 @@ def get_legal_move_indices(board):
 
 def _encode_board_py(board):
 	"""Pure-Python board encoder.  See encode_board for plane layout."""
+	# Capture clock values before mirroring (they survive the mirror but we want
+	# to read them from the original board for clarity).
+	halfmove = board.halfmove_clock
+	fullmove = board.fullmove_number
+
 	if board.turn == chess.BLACK:
 		board = board.mirror()
 
-	state = np.zeros((18, 8, 8), dtype=np.float32)
+	state = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
 
 	piece_types = [
 		chess.PAWN, chess.KNIGHT, chess.BISHOP,
@@ -151,16 +162,21 @@ def _encode_board_py(board):
 
 	state[17][:, :] = 1.0
 
+	# Progress/phase planes (50-move rule + game length).  Without these the
+	# network has no way to tell a fresh middlegame from a drawn endgame.
+	state[18][:, :] = min(halfmove, int(_HALFMOVE_DIVISOR)) / _HALFMOVE_DIVISOR
+	state[19][:, :] = min(fullmove, int(_FULLMOVE_DIVISOR)) / _FULLMOVE_DIVISOR
+
 	return state
 
 
 def encode_board(board):
-	"""Encode a chess.Board as an 18x8x8 float32 tensor.
+	"""Encode a chess.Board as a NUM_PLANES x 8 x 8 float32 tensor.
 
 	The board is rendered from the current player's perspective (mirrored when
 	black is to move) so the network always sees the moving side as "white".
 
-	Plane layout:
+	Plane layout (NUM_PLANES = 20):
 	   0-5:  Current player's pieces (P, N, B, R, Q, K)
 	   6-11: Opponent's pieces       (P, N, B, R, Q, K)
 	  12:    Our kingside castling rights
@@ -169,7 +185,12 @@ def encode_board(board):
 	  15:    Their queenside castling rights
 	  16:    En passant square
 	  17:    Ones (current-player indicator)
+	  18:    Halfmove clock / 100           (50-move rule awareness)
+	  19:    Fullmove number / 200          (game-phase indicator)
 	"""
+	halfmove = board.halfmove_clock
+	fullmove = board.fullmove_number
+
 	if _ext.AVAILABLE:
 		turn = board.turn
 		if turn == chess.BLACK:
@@ -188,5 +209,7 @@ def encode_board(board):
 			bool(board.has_kingside_castling_rights(chess.BLACK)),
 			bool(board.has_queenside_castling_rights(chess.BLACK)),
 			board.ep_square if board.ep_square is not None else -1,
+			int(halfmove),
+			int(fullmove),
 		)
 	return _encode_board_py(board)
