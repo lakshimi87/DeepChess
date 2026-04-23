@@ -1,6 +1,7 @@
 # DeepChess
 checkpoints/*
 !checkpoints/.gitkeep
+!checkpoints/latest.pt
 
 # Compiled C++ extension
 src/_ext/*.so
