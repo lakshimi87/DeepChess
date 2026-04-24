@@ -118,26 +118,33 @@ MOVE_TESTS = [
 
 # Each eval test: (FEN, expected_winner, description)
 # expected_winner = "white" | "black" | "draw"
+#
+# Positions are mid-game configurations reachable from normal play — an
+# AlphaZero-style value head only sees the distribution of positions that
+# arise in self-play, so "starting position minus one backrank piece" is
+# out-of-distribution and tells us nothing about whether the net has
+# learned to count material.  These FENs keep realistic pawn structures,
+# developed minor pieces, and intact castling rights.
 EVAL_TESTS = [
-	("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+	("r1b1kb1r/ppp2ppp/2n2n2/3pp3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 0 6",
 	 "white",
-	 "White up a queen"),
+	 "White up a queen (mid-game)"),
 
-	("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/1NBQKBNR w Kkq - 0 1",
+	("r1bqkb1r/ppp2ppp/2n2n2/3pp3/4P3/2N2N2/PPPP1PPP/R1BQKB2 w Qkq - 0 6",
 	 "black",
-	 "Black up a rook"),
+	 "Black up a rook (mid-game)"),
 
-	("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+	("r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 4 4",
 	 "draw",
-	 "Starting position (equal)"),
+	 "Four Knights Game (equal)"),
 
-	("rn1qkb1r/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+	("r1bqk2r/ppp2ppp/5n2/3pp3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 0 6",
 	 "white",
-	 "White up bishop + knight"),
+	 "White up bishop + knight (mid-game)"),
 
-	("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1",
+	("r1bqkb1r/ppp2ppp/2n2n2/3pp3/4P3/2N2N2/PPPP1PPP/R1B1KB1R w KQkq - 0 6",
 	 "black",
-	 "Black up a queen"),
+	 "Black up a queen (mid-game)"),
 ]
 
 
