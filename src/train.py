@@ -262,6 +262,9 @@ def main():
 			nesterov=True,
 			weight_decay=args.weight_decay,
 		)
+		if last_iter > 0:
+			for pg in opt.param_groups:
+				pg.setdefault("initial_lr", pg["lr"])
 		sched = torch.optim.lr_scheduler.MultiStepLR(
 			opt,
 			milestones=args.lr_milestones,
