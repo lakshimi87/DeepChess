@@ -8,6 +8,27 @@ from . import _ext
 from .board_utils import encode_board, get_legal_move_indices, NUM_MOVES
 
 
+def _is_terminal_fast(board):
+	"""Cheap terminal check used inside MCTS descent.
+
+	Returns ``(terminal, value)`` where *value* is from the perspective of
+	the side to move (-1 for being mated, 0 for any kind of draw).
+
+	Skips the threefold/fivefold-repetition scan that ``Board.is_game_over``
+	performs — that scan walks the whole move stack and shows up as ~30% of
+	per-move CPU time in profiling.  ``play_game``'s outer loop still uses
+	``board.is_game_over()`` for the *actual* game termination, so a missed
+	repetition only affects rare leaves visited mid-search.
+	"""
+	if not any(board.generate_legal_moves()):
+		return True, (-1.0 if board.is_check() else 0.0)
+	if board.halfmove_clock >= 100:
+		return True, 0.0
+	if board.is_insufficient_material():
+		return True, 0.0
+	return False, None
+
+
 class MCTSNode:
 	"""Single node in the MCTS search tree.
 
@@ -48,12 +69,18 @@ class MCTS:
 		self.c_puct = c_puct
 		self.batch_size = max(1, int(batch_size))
 		self._use_ext = _ext.AVAILABLE
+		# Inputs are encoded as float32 on the host; cast to whatever dtype the
+		# model expects (fp16 self-play clones run ~10% faster on MPS).
+		try:
+			self._model_dtype = next(model.parameters()).dtype
+		except StopIteration:
+			self._model_dtype = torch.float32
 
 	# ------------------------------------------------------------------
 	# Neural-network evaluation
 	# ------------------------------------------------------------------
 
-	@torch.no_grad()
+	@torch.inference_mode()
 	def evaluate(self, board):
 		"""Run the NN on *board* and return (policy, value).
 
@@ -62,22 +89,28 @@ class MCTS:
 		player's perspective.
 		"""
 		state = encode_board(board)
-		tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
+		tensor = torch.from_numpy(state).unsqueeze(0).to(
+			self.device, dtype=self._model_dtype,
+		)
 		policy_logits, value = self.model(tensor)
-		policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-		return policy, value.item()
+		policy = torch.softmax(policy_logits, dim=1).float().squeeze(0).cpu().numpy()
+		return policy, float(value.item())
 
-	@torch.no_grad()
+	@torch.inference_mode()
 	def evaluate_batch(self, boards):
 		"""Run the NN on a list of boards and return (policies, values).
 
 		*policies* is a numpy array (B, NUM_MOVES); *values* is (B,).
 		"""
 		states = np.stack([encode_board(b) for b in boards])
-		tensor = torch.from_numpy(states).to(self.device)
+		tensor = torch.from_numpy(states).to(
+			self.device, dtype=self._model_dtype,
+		)
 		policy_logits, values = self.model(tensor)
-		policies = torch.softmax(policy_logits, dim=1).cpu().numpy()
-		values_np = values.squeeze(-1).cpu().numpy()
+		# .float() before .cpu() so downstream numpy stays fp32 even when the
+		# model runs in fp16.
+		policies = torch.softmax(policy_logits, dim=1).float().cpu().numpy()
+		values_np = values.squeeze(-1).float().cpu().numpy()
 		return policies, values_np
 
 	# ------------------------------------------------------------------
@@ -174,7 +207,8 @@ class MCTS:
 				node = root
 				scratch = board.copy()
 				path = []
-				while node.expanded and not scratch.is_game_over():
+				term, term_val = _is_terminal_fast(scratch)
+				while not term and node.expanded:
 					idx = self._select_child(node)
 					node.visits[idx] += 1
 					node.total_values[idx] += 1.0  # virtual loss
@@ -185,13 +219,13 @@ class MCTS:
 						child = MCTSNode()
 						node.children_nodes[idx] = child
 					node = child
+					term, term_val = _is_terminal_fast(scratch)
 
 				paths.append(path)
-				if scratch.is_game_over():
-					value = -1.0 if scratch.is_checkmate() else 0.0
+				if term:
 					leaf_nodes.append(None)
 					leaf_boards.append(None)
-					leaf_terminal_values.append(value)
+					leaf_terminal_values.append(term_val)
 				else:
 					leaf_nodes.append(node)
 					leaf_boards.append(scratch)

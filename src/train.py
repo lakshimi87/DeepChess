@@ -10,6 +10,7 @@ loads the latest checkpoint and continues from where it left off.
 """
 
 import argparse
+import copy
 import os
 import random
 import signal
@@ -197,7 +198,7 @@ def main():
 	                    help="Self-play games per iteration")
 	parser.add_argument("--simulations", type=int, default=400,
 	                    help="MCTS simulations per move during self-play")
-	parser.add_argument("--mcts-batch", type=int, default=16,
+	parser.add_argument("--mcts-batch", type=int, default=32,
 	                    help="MCTS leaf batch size (virtual-loss parallelism). "
 	                         "Higher = fewer NN forward passes but less tree "
 	                         "diversity.  8–32 is a good range.")
@@ -353,15 +354,23 @@ def main():
 		print(f"{'=' * 60}")
 
 		# -- self-play --
+		# fp16 inference clone — keeps the fp32 training weights pristine while
+		# letting the GPU run self-play 5–12% faster on MPS / CUDA.  CPU fp16
+		# is slower than fp32, so we skip the cast there.
+		if device.type in ("cuda", "mps"):
+			eval_model = copy.deepcopy(model).eval().half()
+		else:
+			eval_model = model
 		print(f"Self-play: {args.games_per_iter} games, "
-		      f"{args.simulations} sims/move …")
+		      f"{args.simulations} sims/move "
+		      f"(dtype={next(eval_model.parameters()).dtype}) …")
 		iter_examples = []
 		t0 = time.time()
 		for g in range(args.games_per_iter):
 			if interrupted:
 				break
 			examples, result = play_game(
-				model, device,
+				eval_model, device,
 				num_simulations=args.simulations,
 				max_moves=args.max_moves,
 				mcts_batch=args.mcts_batch,
@@ -376,6 +385,10 @@ def main():
 		replay_buffer.extend(iter_examples)
 		print(f"Self-play done in {elapsed:.1f}s  |  "
 		      f"Buffer: {len(replay_buffer)} positions")
+
+		# Free the fp16 clone before training rebuilds gradients on the fp32 model.
+		if eval_model is not model:
+			del eval_model
 
 		if interrupted:
 			break
