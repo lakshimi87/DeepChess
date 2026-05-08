@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import os
+import random
 import sys
 import threading
 
@@ -52,7 +53,7 @@ RANKS = "87654321"
 # ===================================================================
 
 class ChessGame:
-	def __init__(self, difficulty="normal"):
+	def __init__(self, difficulty="normal", color="random"):
 		pygame.init()
 		self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
 		pygame.display.set_caption("DeepChess")
@@ -69,9 +70,11 @@ class ChessGame:
 
 		# State
 		self.difficulty = difficulty
+		self.color_choice = color
 		self.board = chess.Board()
 		self.engine = Engine(difficulty=difficulty)
-		self.player_color = chess.WHITE
+		self.player_color = self._pick_color(color)
+		self.flipped = self.player_color == chess.BLACK
 
 		self.selected_sq = None
 		self.legal_for_selected = []
@@ -80,6 +83,17 @@ class ChessGame:
 		self.game_over = False
 		self.promotion_pending = None  # (from_sq, to_sq)
 		self.promotion_rects = {}
+
+		if self.player_color == chess.BLACK:
+			self._start_ai()
+
+	@staticmethod
+	def _pick_color(choice):
+		if choice == "white":
+			return chess.WHITE
+		if choice == "black":
+			return chess.BLACK
+		return random.choice([chess.WHITE, chess.BLACK])
 
 	# ------------------------------------------------------------------
 	# Asset loading
@@ -108,18 +122,26 @@ class ChessGame:
 	# Coordinate helpers
 	# ------------------------------------------------------------------
 
-	@staticmethod
-	def sq_to_screen(sq):
-		col = chess.square_file(sq)
-		row = 7 - chess.square_rank(sq)
+	def sq_to_screen(self, sq):
+		f = chess.square_file(sq)
+		r = chess.square_rank(sq)
+		if self.flipped:
+			col = 7 - f
+			row = r
+		else:
+			col = f
+			row = 7 - r
 		return col * SQUARE_SIZE, row * SQUARE_SIZE
 
-	@staticmethod
-	def screen_to_sq(pos):
+	def screen_to_sq(self, pos):
 		x, y = pos
 		if x >= BOARD_PX or y >= BOARD_PX:
 			return None
-		return chess.square(x // SQUARE_SIZE, 7 - y // SQUARE_SIZE)
+		col = x // SQUARE_SIZE
+		row = y // SQUARE_SIZE
+		if self.flipped:
+			return chess.square(7 - col, row)
+		return chess.square(col, 7 - row)
 
 	# ------------------------------------------------------------------
 	# Drawing
@@ -134,13 +156,15 @@ class ChessGame:
 					(col * SQUARE_SIZE, row * SQUARE_SIZE, SQUARE_SIZE, SQUARE_SIZE),
 				)
 		# Coordinate labels
+		files = FILES[::-1] if self.flipped else FILES
+		ranks = RANKS[::-1] if self.flipped else RANKS
 		for col in range(8):
 			c = DARK_SQ if col % 2 == 0 else LIGHT_SQ
-			lbl = self.font_sm.render(FILES[col], True, c)
+			lbl = self.font_sm.render(files[col], True, c)
 			self.screen.blit(lbl, (col * SQUARE_SIZE + SQUARE_SIZE - 12, BOARD_PX - 16))
 		for row in range(8):
 			c = LIGHT_SQ if row % 2 == 0 else DARK_SQ
-			lbl = self.font_sm.render(RANKS[row], True, c)
+			lbl = self.font_sm.render(ranks[row], True, c)
 			self.screen.blit(lbl, (2, row * SQUARE_SIZE + 1))
 
 	def _draw_highlights(self):
@@ -454,11 +478,15 @@ class ChessGame:
 		if self.ai_thinking:
 			return
 		self.board = chess.Board()
+		self.player_color = self._pick_color(self.color_choice)
+		self.flipped = self.player_color == chess.BLACK
 		self.selected_sq = None
 		self.legal_for_selected = []
 		self.last_move = None
 		self.game_over = False
 		self.promotion_pending = None
+		if self.player_color == chess.BLACK:
+			self._start_ai()
 
 	def _undo(self):
 		if self.ai_thinking:
@@ -535,8 +563,13 @@ def main():
 		choices=["easy", "normal", "hard"],
 		help="AI difficulty level",
 	)
+	parser.add_argument(
+		"--color", type=str, default="random",
+		choices=["white", "black", "random"],
+		help="Human player's color (board flips when playing black)",
+	)
 	args = parser.parse_args()
-	game = ChessGame(difficulty=args.difficulty)
+	game = ChessGame(difficulty=args.difficulty, color=args.color)
 	game.run()
 
 
