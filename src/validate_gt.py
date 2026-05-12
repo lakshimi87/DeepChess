@@ -20,7 +20,7 @@ import time
 import chess
 import torch
 
-from .board_utils import encode_board
+from .board_utils import encode_board, get_legal_move_indices
 from .model import ChessNet
 from .mcts import MCTS
 from .engine import _ClassicalEngine, get_device
@@ -59,6 +59,16 @@ MOVE_TESTS = [
 	 ["h5f7"],
 	 "Scholar's mate Qxf7#"),
 
+	("Mate in 1",
+	 "k7/8/1K6/2Q5/8/8/8/8 w - - 0 1",
+	 ["c5c8"],
+	 "Queen mates K in corner"),
+
+	("Mate in 1",
+	 "6rk/6pp/7N/8/8/8/8/4K3 w - - 0 1",
+	 ["h6f7"],
+	 "Smothered mate Nf7#"),
+
 	# ── Win material (capture undefended piece) ───────────────────
 	("Win Material",
 	 "rnb1kbnr/pppppppp/8/3q4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1",
@@ -84,6 +94,17 @@ MOVE_TESTS = [
 	 "rnbqkbnr/ppp1pppp/8/3p4/2B5/8/PPPPPPPP/RNBQK1NR b KQkq - 0 1",
 	 ["d5c4"],
 	 "Capture hanging bishop (black)"),
+
+	("Win Material",
+	 "rnbqkbnr/ppp1pppp/8/8/3P4/2N1n3/PPP1PPPP/R1BQKBNR w KQkq - 0 1",
+	 ["f2e3"],
+	 "Capture hanging knight (pawn)"),
+
+	# ── Endgame: technique that decides a won game ───────────────
+	("Endgame",
+	 "k7/4P3/4K3/8/8/8/8/8 w - - 0 1",
+	 ["e7e8q", "e7e8r", "e7e8b", "e7e8n"],
+	 "Promote pawn (winning)"),
 
 	# ── Opening quality (any reasonable book move passes) ─────────
 	("Opening",
@@ -145,6 +166,20 @@ EVAL_TESTS = [
 	("r1bqkb1r/ppp2ppp/2n2n2/3pp3/4P3/2N2N2/PPPP1PPP/R1B1KB1R w KQkq - 0 6",
 	 "black",
 	 "Black up a queen (mid-game)"),
+
+	# Endgame evals (clear material picture; tests the value head on
+	# endgames it rarely sees during mid-game self-play).
+	("4k3/8/4K3/8/8/8/8/3Q4 w - - 0 1",
+	 "white",
+	 "K+Q vs K (winning)"),
+
+	("4k3/8/4K3/8/8/8/8/3R4 w - - 0 1",
+	 "white",
+	 "K+R vs K (winning)"),
+
+	("8/8/4k3/8/4B3/4K3/8/8 w - - 0 1",
+	 "draw",
+	 "K+B vs K (insufficient material)"),
 ]
 
 
@@ -178,13 +213,41 @@ def _eval_ok(value, expected, turn, threshold=0.15, draw_tol=0.30):
 # Engine runners
 # ═══════════════════════════════════════════════════════════════════════
 
-def neural_move(model, device, fen, sims):
+def neural_move(model, device, fen, sims, top_k=3):
+	"""Run MCTS and return chosen move plus diagnostic info.
+
+	Returns dict with: uci, san, top (list of (san, prob) tuples sorted by
+	visit count), val (raw value-head output from current player's POV).
+	"""
 	board = chess.Board(fen)
 	mcts = MCTS(model, device, num_simulations=sims)
-	move, _ = mcts.search(board, temperature=0.01)
+	move, policy = mcts.search(board, temperature=0.01)
+
+	# Raw value head (independent of MCTS).
+	state = encode_board(board)
+	with torch.no_grad():
+		t = torch.from_numpy(state).unsqueeze(0).to(device)
+		_, v = model(t)
+	val = float(v.item())
+
 	if move is None:
-		return None, "-"
-	return move.uci(), board.san(move)
+		return dict(uci=None, san="-", top=[], val=val)
+
+	legal_moves, indices = get_legal_move_indices(board)
+	scored = sorted(
+		((float(policy[idx]), m) for m, idx in zip(legal_moves, indices)),
+		key=lambda x: x[0],
+		reverse=True,
+	)
+	top = []
+	for prob, m in scored[:top_k]:
+		if prob <= 0:
+			break
+		try:
+			top.append((board.san(m), prob))
+		except Exception:
+			top.append((m.uci(), prob))
+	return dict(uci=move.uci(), san=board.san(move), top=top, val=val)
 
 
 def classical_move(fen, depth=3):
@@ -228,33 +291,47 @@ def _ordered_categories():
 
 
 def run_suite(model, device, sims, depth=3):
-	"""Run every test.  Returns ``(results_dict, categories)``."""
+	"""Run every test.  Returns ``(results_dict, categories)``.
+
+	Each entry in ``res['nm'][cat]`` / ``res['cm'][cat]`` is a dict with
+	keys: ok, san, uci, exp, desc, dt, n_legal, and (neural only) top, val.
+	"""
 	cats = _ordered_categories()
-	res = dict(nm={}, cm={}, ne=[], ce=[])  # neural/classical × move/eval
+	res = dict(nm={}, cm={}, ne=[], ce=[])
 
 	for cat, fen, acceptable, desc in MOVE_TESTS:
 		exp_san = _uci_to_san(fen, acceptable)
+		n_legal = chess.Board(fen).legal_moves.count()
 
-		# Neural
 		if model is not None:
-			uci, san = neural_move(model, device, fen, sims)
-			ok = uci in acceptable
-			res["nm"].setdefault(cat, []).append((ok, san, exp_san, desc))
+			t0 = time.time()
+			nm = neural_move(model, device, fen, sims)
+			dt = time.time() - t0
+			ok = nm["uci"] in acceptable
+			res["nm"].setdefault(cat, []).append(dict(
+				ok=ok, san=nm["san"], uci=nm["uci"], exp=exp_san,
+				desc=desc, dt=dt, n_legal=n_legal,
+				top=nm["top"], val=nm["val"],
+			))
 
-		# Classical
+		t0 = time.time()
 		uci, san = classical_move(fen, depth)
+		dt = time.time() - t0
 		ok = (uci in acceptable) if uci else False
-		res["cm"].setdefault(cat, []).append((ok, san, exp_san, desc))
+		res["cm"].setdefault(cat, []).append(dict(
+			ok=ok, san=san, uci=uci, exp=exp_san,
+			desc=desc, dt=dt, n_legal=n_legal,
+		))
 
 	for fen, expected, desc in EVAL_TESTS:
 		board = chess.Board(fen)
 		if model is not None:
 			v = neural_eval(model, device, fen)
 			ok = _eval_ok(v, expected, board.turn)
-			res["ne"].append((ok, v, expected, desc))
+			res["ne"].append(dict(ok=ok, val=v, exp=expected, desc=desc))
 		v = classical_eval(fen)
 		ok = _eval_ok(v, expected, board.turn)
-		res["ce"].append((ok, v, expected, desc))
+		res["ce"].append(dict(ok=ok, val=v, exp=expected, desc=desc))
 
 	return res, cats
 
@@ -268,49 +345,92 @@ F = "FAIL"
 
 
 def _score(tests):
-	return sum(t[0] for t in tests), len(tests)
+	return sum(t["ok"] for t in tests), len(tests)
+
+
+def _fmt_top(top):
+	"""Format top-K candidate moves as 'Nf3 62% e4 18% d4 12%'."""
+	if not top:
+		return "-"
+	return "  ".join(f"{s} {p*100:.0f}%" for s, p in top)
 
 
 def print_detail(res, cats, has_neural):
-	"""Detailed per-test results for the primary engine."""
-	key = "nm" if has_neural else "cm"
-	label = "Neural" if has_neural else "Classical"
+	"""Detailed per-test results.
+
+	When the neural engine is available, prints neural and classical
+	side-by-side per test plus top-3 candidates and the value-head output.
+	"""
+	width = 78
 
 	for cat in cats:
-		tests = res[key].get(cat, [])
-		p, t = _score(tests)
-		print(f"\n{'─' * 56}")
-		print(f"  {cat}  ({label})  [{p}/{t}]")
-		print(f"{'─' * 56}")
-		for i, (ok, san, exp, desc) in enumerate(tests, 1):
-			tag = P if ok else F
-			print(f"  [{i}] {tag:4s}  {desc:<34s} {san:<10s} (expected {exp})")
+		nm = res["nm"].get(cat, []) if has_neural else []
+		cm = res["cm"].get(cat, [])
+		tests_for_score = nm if has_neural else cm
+		p, t = _score(tests_for_score)
 
-	# Eval
-	key_e = "ne" if has_neural else "ce"
-	tests = res[key_e]
-	if tests:
-		p, t = _score(tests)
-		print(f"\n{'─' * 56}")
-		print(f"  Evaluation  ({label})  [{p}/{t}]")
-		print(f"{'─' * 56}")
-		for i, (ok, v, exp, desc) in enumerate(tests, 1):
-			tag = P if ok else F
-			print(f"  [{i}] {tag:4s}  {desc:<34s} val={v:+.3f}  (expected {exp})")
+		# Header summarises pass-rate and avg neural time.
+		header = f"  {cat}  ({'Neural' if has_neural else 'Classical'}) [{p}/{t}]"
+		if has_neural and nm:
+			avg_ms = 1000 * sum(x["dt"] for x in nm) / len(nm)
+			header += f"   avg {avg_ms:.0f} ms/move"
+		print(f"\n{'─' * width}")
+		print(header)
+		print(f"{'─' * width}")
+
+		count = max(len(nm), len(cm))
+		for i in range(count):
+			n = nm[i] if i < len(nm) else None
+			c = cm[i] if i < len(cm) else None
+			desc = (n or c)["desc"]
+			exp = (n or c)["exp"]
+			n_legal = (n or c)["n_legal"]
+			print(f"  [{i+1:2d}] {desc}   ({n_legal} legal, expected {exp})")
+			if n is not None:
+				tag = P if n["ok"] else F
+				print(f"        N {tag:4s} {n['san']:<8s} val={n['val']:+.2f}  "
+				      f"top: {_fmt_top(n['top'])}")
+			if c is not None:
+				tag = P if c["ok"] else F
+				print(f"        C {tag:4s} {c['san']:<8s}")
+
+	# Eval tests
+	ne = res["ne"] if has_neural else []
+	ce = res["ce"]
+	if ne or ce:
+		tests_for_score = ne if has_neural else ce
+		p, t = _score(tests_for_score)
+		print(f"\n{'─' * width}")
+		print(f"  Evaluation  ({'Neural' if has_neural else 'Classical'}) [{p}/{t}]")
+		print(f"{'─' * width}")
+		count = max(len(ne), len(ce))
+		for i in range(count):
+			n = ne[i] if i < len(ne) else None
+			c = ce[i] if i < len(ce) else None
+			desc = (n or c)["desc"]
+			exp = (n or c)["exp"]
+			print(f"  [{i+1:2d}] {desc}   (expected {exp})")
+			if n is not None:
+				tag = P if n["ok"] else F
+				print(f"        N {tag:4s} val={n['val']:+.3f}")
+			if c is not None:
+				tag = P if c["ok"] else F
+				print(f"        C {tag:4s} val={c['val']:+.3f}")
 
 
 def print_summary(res, cats, has_neural):
 	"""Side-by-side summary table.  Returns (n_pass, n_total) for neural."""
-	print(f"\n{'=' * 56}")
+	width = 62
+	print(f"\n{'=' * width}")
 	print(f"  SUMMARY")
-	print(f"{'=' * 56}")
+	print(f"{'=' * width}")
 
 	hdr = f"  {'Category':<20s}"
 	if has_neural:
-		hdr += f"{'Neural':>10s}"
-	hdr += f"{'Classical':>12s}"
+		hdr += f"{'Neural':>12s}"
+	hdr += f"{'Classical':>14s}"
 	print(hdr)
-	print(f"  {'─' * 50}")
+	print(f"  {'─' * (width - 2)}")
 
 	n_p, n_t = 0, 0
 	c_p, c_t = 0, 0
@@ -320,33 +440,80 @@ def print_summary(res, cats, has_neural):
 		if has_neural:
 			p, t = _score(res["nm"].get(cat, []))
 			n_p += p; n_t += t
-			line += f"{p:>4d}/{t:<4d}    "
+			line += f"{p:>5d}/{t:<5d} "
 		p, t = _score(res["cm"].get(cat, []))
 		c_p += p; c_t += t
-		line += f"{p:>4d}/{t:<4d}"
+		line += f"{p:>6d}/{t:<5d}"
 		print(line)
 
-	# Eval row
 	line = f"  {'Evaluation':<20s}"
 	if has_neural:
 		p, t = _score(res["ne"])
 		n_p += p; n_t += t
-		line += f"{p:>4d}/{t:<4d}    "
+		line += f"{p:>5d}/{t:<5d} "
 	p, t = _score(res["ce"])
 	c_p += p; c_t += t
-	line += f"{p:>4d}/{t:<4d}"
+	line += f"{p:>6d}/{t:<5d}"
 	print(line)
 
-	print(f"  {'─' * 50}")
+	print(f"  {'─' * (width - 2)}")
 	line = f"  {'TOTAL':<20s}"
 	if has_neural:
 		pct = 100 * n_p / n_t if n_t else 0
-		line += f"{n_p:>4d}/{n_t:<4d} ({pct:4.0f}%)"
+		line += f"{n_p:>5d}/{n_t:<3d} ({pct:3.0f}%) "
 	pct = 100 * c_p / c_t if c_t else 0
-	line += f"  {c_p:>4d}/{c_t:<4d} ({pct:4.0f}%)"
+	line += f"{c_p:>4d}/{c_t:<3d} ({pct:3.0f}%)"
 	print(line)
 
 	return n_p, n_t
+
+
+def print_comparison(res, cats):
+	"""Neural vs Classical: agreement, both-pass, confidence, timing.
+
+	Only printed when both engines ran (i.e. a neural checkpoint loaded).
+	"""
+	width = 78
+	print(f"\n{'=' * width}")
+	print("  NEURAL vs CLASSICAL")
+	print(f"{'=' * width}")
+	print(f"  {'Category':<16s} {'Agree':>9s} {'BothOK':>9s} "
+	      f"{'Conf':>8s} {'N ms':>8s} {'C ms':>8s}")
+	print(f"  {'─' * (width - 4)}")
+
+	tot_agree = tot_both = tot_n = 0
+	confs = []
+	n_times = []
+	c_times = []
+	for cat in cats:
+		nm = res["nm"].get(cat, [])
+		cm = res["cm"].get(cat, [])
+		if not nm or not cm:
+			continue
+		agree = sum(1 for n, c in zip(nm, cm) if n["uci"] == c["uci"])
+		both = sum(1 for n, c in zip(nm, cm) if n["ok"] and c["ok"])
+		cat_conf = [n["top"][0][1] for n in nm if n["top"]]
+		avg_conf = sum(cat_conf) / len(cat_conf) if cat_conf else 0.0
+		avg_n = 1000 * sum(n["dt"] for n in nm) / len(nm)
+		avg_c = 1000 * sum(c["dt"] for c in cm) / len(cm)
+		confs.extend(cat_conf)
+		n_times.extend(n["dt"] for n in nm)
+		c_times.extend(c["dt"] for c in cm)
+		tot_agree += agree
+		tot_both += both
+		tot_n += len(nm)
+		print(f"  {cat:<16s} {agree:>4d}/{len(nm):<4d} "
+		      f"{both:>4d}/{len(nm):<4d} "
+		      f"{avg_conf*100:>6.0f}%  {avg_n:>6.0f}  {avg_c:>6.0f}")
+
+	if tot_n:
+		print(f"  {'─' * (width - 4)}")
+		avg_conf = sum(confs) / len(confs) if confs else 0.0
+		avg_n = 1000 * sum(n_times) / len(n_times) if n_times else 0.0
+		avg_c = 1000 * sum(c_times) / len(c_times) if c_times else 0.0
+		print(f"  {'TOTAL':<16s} {tot_agree:>4d}/{tot_n:<4d} "
+		      f"{tot_both:>4d}/{tot_n:<4d} "
+		      f"{avg_conf*100:>6.0f}%  {avg_n:>6.0f}  {avg_c:>6.0f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -473,6 +640,8 @@ def main():
 	has_neural = model is not None
 	print_detail(results, cats, has_neural)
 	n_pass, n_total = print_summary(results, cats, has_neural)
+	if has_neural:
+		print_comparison(results, cats)
 	print(f"\n  Completed in {elapsed:.1f}s")
 
 	# History
