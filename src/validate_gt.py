@@ -5,9 +5,11 @@ Tests the neural engine (and classical baseline) against curated positions
 with known best moves and known evaluations.  Use after training to measure
 how well the model has learned.
 
-    ./validate_gt.sh                    # test latest checkpoint
+    ./validate_gt.sh                    # test latest checkpoint + 20-game match
     ./validate_gt.sh --history          # show progress across all checkpoints
     ./validate_gt.sh --simulations 400  # more MCTS sims (slower but fairer)
+    ./validate_gt.sh --games 0          # skip the head-to-head match
+    ./validate_gt.sh --games 50         # longer match for tighter win-rate CI
 """
 
 import argparse
@@ -584,6 +586,89 @@ def run_history(checkpoint_dir, device, sims, depth=3):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Head-to-head match: Neural vs Classical (the "ground truth" opponent)
+# ═══════════════════════════════════════════════════════════════════════
+
+def play_match(model, device, num_games, sims, depth,
+               opening_temp_plies=8, max_plies=300):
+	"""Play *num_games* between the neural engine and the classical engine.
+
+	Colors alternate every game so neither side gets a permanent first-move
+	advantage.  A small temperature is applied to the neural engine's
+	opening moves so the 20 games don't collapse into one deterministic
+	line repeated 10 times.
+
+	Returns ``(wins, losses, draws)`` from the neural engine's perspective.
+	"""
+	classical = _ClassicalEngine(depth=depth)
+	mcts = MCTS(model, device, num_simulations=sims, batch_size=16)
+
+	wins = losses = draws = 0
+	width = 78
+	print(f"\n{'=' * width}")
+	print(f"  MATCH  Neural vs Classical (GT)   {num_games} games, "
+	      f"{sims} sims, depth {depth}")
+	print(f"{'=' * width}")
+	print(f"  {'#':>3s}  {'Neural':>7s}  {'Result':>7s}  {'Outcome':>8s}  "
+	      f"{'Plies':>5s}  {'Time':>7s}")
+	print(f"  {'─' * (width - 4)}")
+
+	match_t0 = time.time()
+	for g in range(num_games):
+		neural_is_white = (g % 2 == 0)
+		board = chess.Board()
+		ply = 0
+		g_t0 = time.time()
+
+		while not board.is_game_over(claim_draw=True) and ply < max_plies:
+			neural_to_move = (board.turn == chess.WHITE) == neural_is_white
+			if neural_to_move:
+				temp = 1.0 if ply < opening_temp_plies else 0.01
+				move, _ = mcts.search(board, temperature=temp)
+			else:
+				move = classical.get_move(board)
+			if move is None:
+				break
+			board.push(move)
+			ply += 1
+
+		result = board.result(claim_draw=True)
+		if result == "1-0":
+			neural_won = neural_is_white
+		elif result == "0-1":
+			neural_won = not neural_is_white
+		else:
+			neural_won = None
+
+		if neural_won is True:
+			wins += 1
+			outcome = "WIN"
+		elif neural_won is False:
+			losses += 1
+			outcome = "LOSS"
+		else:
+			draws += 1
+			outcome = "DRAW"
+
+		dt = time.time() - g_t0
+		color = "white" if neural_is_white else "black"
+		print(f"  {g+1:>3d}  {color:>7s}  {result:>7s}  {outcome:>8s}  "
+		      f"{ply:>5d}  {dt:>6.1f}s")
+
+	total = wins + losses + draws
+	score = wins + 0.5 * draws
+	win_rate = 100 * score / total if total else 0.0
+	elapsed = time.time() - match_t0
+
+	print(f"  {'─' * (width - 4)}")
+	print(f"  RESULT  W={wins}  L={losses}  D={draws}   "
+	      f"score {score:.1f}/{total}   win rate {win_rate:.1f}%   "
+	      f"({elapsed:.1f}s)")
+
+	return wins, losses, draws
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -603,6 +688,9 @@ def main():
 	                help="Classical engine search depth")
 	ap.add_argument("--history", action="store_true",
 	                help="Evaluate every numbered checkpoint and show progress")
+	ap.add_argument("--games", type=int, default=20,
+	                help="Play this many games against the classical engine "
+	                     "(0 to skip)")
 	args = ap.parse_args()
 
 	device = get_device()
@@ -643,6 +731,10 @@ def main():
 	if has_neural:
 		print_comparison(results, cats)
 	print(f"\n  Completed in {elapsed:.1f}s")
+
+	# Head-to-head match
+	if has_neural and args.games > 0:
+		play_match(model, device, args.games, args.simulations, args.depth)
 
 	# History
 	if args.history:
