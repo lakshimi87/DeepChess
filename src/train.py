@@ -196,7 +196,7 @@ def main():
 	                    help="Number of train iterations to run")
 	parser.add_argument("--games-per-iter", type=int, default=50,
 	                    help="Self-play games per iteration")
-	parser.add_argument("--simulations", type=int, default=400,
+	parser.add_argument("--simulations", type=int, default=600,
 	                    help="MCTS simulations per move during self-play")
 	parser.add_argument("--mcts-batch", type=int, default=32,
 	                    help="MCTS leaf batch size (virtual-loss parallelism). "
@@ -236,9 +236,9 @@ def main():
 	parser.add_argument("--checkpoint-every", type=int, default=10,
 	                    help="Write a numbered checkpoint every N iterations "
 	                         "(latest.pt is refreshed every iteration)")
-	parser.add_argument("--res-blocks", type=int, default=10,
+	parser.add_argument("--res-blocks", type=int, default=16,
 	                    help="Residual blocks in the network")
-	parser.add_argument("--filters", type=int, default=128,
+	parser.add_argument("--filters", type=int, default=192,
 	                    help="Convolutional filters per layer")
 	parser.add_argument("--from-scratch", action="store_true",
 	                    help="Ignore any existing latest.pt and start fresh. "

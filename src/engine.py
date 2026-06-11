@@ -13,7 +13,7 @@ from .paths import CHECKPOINTS_DIR
 # Difficulty presets
 # ---------------------------------------------------------------------------
 # Neural engine: number of MCTS simulations
-NEURAL_SIMULATIONS = {"easy": 100, "normal": 400, "hard": 800}
+NEURAL_SIMULATIONS = {"easy": 200, "normal": 800, "hard": 1600}
 # Classical engine: minimax search depth
 CLASSICAL_DEPTH = {"easy": 2, "normal": 3, "hard": 4}
 
@@ -44,13 +44,13 @@ class Engine:
 		if os.path.exists(checkpoint_path):
 			self.mode = "neural"
 			ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-			num_res = ckpt.get("num_res_blocks", 10)
-			num_fil = ckpt.get("num_filters", 128)
+			num_res = ckpt.get("num_res_blocks", 16)
+			num_fil = ckpt.get("num_filters", 192)
 			self.model = ChessNet(num_res_blocks=num_res, num_filters=num_fil)
 			self.model.load_state_dict(ckpt["model_state_dict"])
 			self.model.to(self.device)
 			self.model.eval()
-			sims = NEURAL_SIMULATIONS.get(difficulty, 400)
+			sims = NEURAL_SIMULATIONS.get(difficulty, 800)
 			self.mcts = MCTS(self.model, self.device, num_simulations=sims,
 			                 batch_size=16)
 		else:
@@ -63,7 +63,8 @@ class Engine:
 		if board.is_game_over():
 			return None
 		if self.mode == "neural":
-			move, _ = self.mcts.search(board, temperature=0.1)
+			# Deterministic best move (argmax over visits) for strongest play.
+			move, _ = self.mcts.search(board, temperature=0.0)
 			return move
 		return self._classical.get_move(board)
 

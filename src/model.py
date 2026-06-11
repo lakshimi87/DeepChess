@@ -4,6 +4,9 @@ import torch.nn.functional as F
 
 from .board_utils import NUM_MOVES, NUM_PLANES
 
+# Move-type planes per from-square (NUM_MOVES = 64 squares x 73 move types).
+_MOVE_PLANES = NUM_MOVES // 64  # == 73
+
 
 class ResidualBlock(nn.Module):
 	"""Pre-activation residual block: conv -> BN -> ReLU -> conv -> BN + skip -> ReLU."""
@@ -29,8 +32,16 @@ class ChessNet(nn.Module):
 	Architecture:
 	  Input  : NUM_PLANES x 8 x 8 board encoding
 	  Body   : 3x3 conv -> residual tower (num_res_blocks blocks)
-	  Policy : 1x1 conv(32) -> FC -> 4672 logits
+	  Policy : 3x3 conv -> 1x1 conv(73 planes) -> 4672 logits (no FC)
 	  Value  : 1x1 conv(32) -> FC(256) -> FC(1) -> tanh
+
+	Policy head is fully convolutional (AlphaZero-style).  The final 1x1 conv
+	emits 73 move-type planes over the 8x8 board; flattening as
+	(from_square, move_type) — index = from_sq*73 + move_type — matches
+	board_utils.move_to_index exactly, so each logit's spatial position is its
+	move's from-square.  This shares weights across the board instead of the
+	old flatten->Linear(2048, 4672) head, which alone held ~9.6M parameters
+	(73% of the whole net) with no spatial weight sharing.
 
 	Note: value head uses 32 channels (not the 1 channel from the AlphaZero
 	paper).  A single-channel value head puts a scalar BN with one γ/β pair
@@ -40,7 +51,7 @@ class ChessNet(nn.Module):
 	without that degenerate fixed point.
 	"""
 
-	def __init__(self, num_res_blocks=10, num_filters=128):
+	def __init__(self, num_res_blocks=16, num_filters=192):
 		super().__init__()
 		self.num_res_blocks = num_res_blocks
 		self.num_filters = num_filters
@@ -54,10 +65,10 @@ class ChessNet(nn.Module):
 			ResidualBlock(num_filters) for _ in range(num_res_blocks)
 		])
 
-		# Policy head
-		self.policy_conv = nn.Conv2d(num_filters, 32, 1, bias=False)
-		self.policy_bn = nn.BatchNorm2d(32)
-		self.policy_fc = nn.Linear(32 * 64, NUM_MOVES)
+		# Policy head — fully convolutional (no FC).
+		self.policy_conv1 = nn.Conv2d(num_filters, num_filters, 3, padding=1, bias=False)
+		self.policy_bn = nn.BatchNorm2d(num_filters)
+		self.policy_conv2 = nn.Conv2d(num_filters, _MOVE_PLANES, 1)
 
 		# Value head — 32 channels + wider FC
 		self.value_conv = nn.Conv2d(num_filters, 32, 1, bias=False)
@@ -73,10 +84,11 @@ class ChessNet(nn.Module):
 		for block in self.res_blocks:
 			out = block(out)
 
-		# Policy head
-		p = F.relu(self.policy_bn(self.policy_conv(out)))
-		p = p.view(p.size(0), -1)
-		p = self.policy_fc(p)
+		# Policy head — (B, 73, 8, 8) reshaped to (B, 4672) as
+		# index = from_sq*73 + move_type so it lines up with board_utils.
+		p = F.relu(self.policy_bn(self.policy_conv1(out)))
+		p = self.policy_conv2(p)
+		p = p.permute(0, 2, 3, 1).reshape(p.size(0), -1)
 
 		# Value head
 		v = F.relu(self.value_bn(self.value_conv(out)))

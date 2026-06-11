@@ -546,8 +546,8 @@ def run_history(checkpoint_dir, device, sims, depth=3):
 		ckpt = torch.load(fpath, map_location=device, weights_only=False)
 		it = ckpt.get("iteration", "?")
 		m = ChessNet(
-			num_res_blocks=ckpt.get("num_res_blocks", 10),
-			num_filters=ckpt.get("num_filters", 128),
+			num_res_blocks=ckpt.get("num_res_blocks", 16),
+			num_filters=ckpt.get("num_filters", 192),
 		)
 		m.load_state_dict(ckpt["model_state_dict"])
 		m.to(device)
@@ -682,7 +682,7 @@ def main():
 	                help="Path to model checkpoint")
 	ap.add_argument("--checkpoint-dir", default=CHECKPOINTS_DIR,
 	                help="Directory with numbered checkpoints (for --history)")
-	ap.add_argument("--simulations", type=int, default=200,
+	ap.add_argument("--simulations", type=int, default=400,
 	                help="MCTS simulations per test position")
 	ap.add_argument("--depth", type=int, default=3,
 	                help="Classical engine search depth")
@@ -706,8 +706,8 @@ def main():
 	model = None
 	if os.path.exists(args.checkpoint):
 		ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-		nr = ckpt.get("num_res_blocks", 10)
-		nf = ckpt.get("num_filters", 128)
+		nr = ckpt.get("num_res_blocks", 16)
+		nf = ckpt.get("num_filters", 192)
 		model = ChessNet(num_res_blocks=nr, num_filters=nf)
 		model.load_state_dict(ckpt["model_state_dict"])
 		model.to(device)
