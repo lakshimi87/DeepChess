@@ -67,6 +67,33 @@ def default_workers(device):
 	return max(1, min(8, cores - 1))
 
 
+def _atomic_save(payload, path):
+	"""``torch.save`` to *path* without ever exposing a partial file.
+
+	``latest.pt`` is ~90 MB and is rewritten every iteration, so a plain
+	``torch.save`` leaves a multi-second window in which the file on disk is
+	truncated or half-written.  Anything reading concurrently — play.sh,
+	validate_gt.sh, a resume from another shell, or a `git add` — can land in
+	that window and get a corrupt checkpoint.  Writing to a temp file in the
+	same directory and renaming makes the swap atomic: readers see either the
+	old checkpoint or the new one, never a mixture.
+
+	The temp name carries the pid so two training runs sharing a checkpoint
+	directory can't clobber each other's partial writes.
+	"""
+	tmp = f"{path}.tmp.{os.getpid()}"
+	try:
+		torch.save(payload, tmp)
+		os.replace(tmp, path)
+	except BaseException:
+		# Don't leave debris behind on interrupt or disk-full.
+		try:
+			os.unlink(tmp)
+		except OSError:
+			pass
+		raise
+
+
 def save_checkpoint(model, optimizer, scheduler, iteration, checkpoint_dir,
                     num_res_blocks, num_filters, numbered=True):
 	"""Write ``latest.pt`` and (optionally) ``model_iter_XXXX.pt``.
@@ -75,6 +102,9 @@ def save_checkpoint(model, optimizer, scheduler, iteration, checkpoint_dir,
 	recent weights.  ``numbered`` controls whether a permanent snapshot is
 	also emitted — the training loop only does this every N iterations to
 	keep disk usage bounded.
+
+	Both writes go through :func:`_atomic_save`, so a reader is never exposed
+	to a partially written checkpoint.
 	"""
 	os.makedirs(checkpoint_dir, exist_ok=True)
 	payload = {
@@ -85,11 +115,10 @@ def save_checkpoint(model, optimizer, scheduler, iteration, checkpoint_dir,
 		"num_res_blocks": num_res_blocks,
 		"num_filters": num_filters,
 	}
-	latest = os.path.join(checkpoint_dir, "latest.pt")
-	torch.save(payload, latest)
 	if numbered:
 		numbered_path = os.path.join(checkpoint_dir, f"model_iter_{iteration:04d}.pt")
-		torch.save(payload, numbered_path)
+		_atomic_save(payload, numbered_path)
+	_atomic_save(payload, os.path.join(checkpoint_dir, "latest.pt"))
 
 
 # ---------------------------------------------------------------------------
