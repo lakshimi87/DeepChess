@@ -92,7 +92,9 @@ class ChessNet(nn.Module):
 
 		# Value head
 		v = F.relu(self.value_bn(self.value_conv(out)))
-		v = v.view(v.size(0), -1)
+		# reshape (not view): under channels_last the NHWC strides aren't
+		# view-compatible with a flat (B, 32*64) layout.
+		v = v.reshape(v.size(0), -1)
 		v = F.relu(self.value_fc1(v))
 		v = torch.tanh(self.value_fc2(v))
 

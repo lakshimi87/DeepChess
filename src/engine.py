@@ -5,9 +5,12 @@ import os
 import chess
 import torch
 
+from . import perf
 from .model import ChessNet
 from .mcts import MCTS
 from .paths import CHECKPOINTS_DIR
+
+perf.configure(num_threads=1)
 
 # ---------------------------------------------------------------------------
 # Difficulty presets
@@ -48,11 +51,10 @@ class Engine:
 			num_fil = ckpt.get("num_filters", 192)
 			self.model = ChessNet(num_res_blocks=num_res, num_filters=num_fil)
 			self.model.load_state_dict(ckpt["model_state_dict"])
-			self.model.to(self.device)
-			self.model.eval()
+			self.model = perf.to_inference(self.model, self.device)
 			sims = NEURAL_SIMULATIONS.get(difficulty, 800)
 			self.mcts = MCTS(self.model, self.device, num_simulations=sims,
-			                 batch_size=16)
+			                 batch_size=64)
 		else:
 			self.mode = "classical"
 			self._classical = _ClassicalEngine(
