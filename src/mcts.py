@@ -10,6 +10,38 @@ from .board_utils import (
 )
 
 
+def _ext_supports_fpu():
+	"""Does the compiled extension's ``puct_select`` take an ``fpu_value``?
+
+	The FPU argument was added after the first .so builds shipped, and a stale
+	extension would silently reject the call.  Probing once here lets us fall
+	back to the (slower) Python PUCT loop with a warning instead of crashing
+	mid-search, and tells the user exactly what to do about it.
+	"""
+	if not _ext.AVAILABLE:
+		return False
+	try:
+		_ext.impl.puct_select(
+			np.ones(1, dtype=np.float32),
+			np.zeros(1, dtype=np.int32),
+			np.zeros(1, dtype=np.float32),
+			1.5, 0.0,
+		)
+		return True
+	except TypeError:
+		import warnings
+		warnings.warn(
+			"src/_ext is built without first-play-urgency support — falling "
+			"back to the pure-Python PUCT loop, which is several times slower. "
+			"Run ./build_ext.sh to rebuild.",
+			RuntimeWarning,
+		)
+		return False
+
+
+_EXT_HAS_FPU = _ext_supports_fpu()
+
+
 def _is_terminal_fast(board):
 	"""Cheap terminal check used inside MCTS descent.
 
@@ -39,7 +71,8 @@ class MCTSNode:
 	the C++ extension.
 	"""
 
-	__slots__ = ["moves", "priors", "visits", "total_values", "children_nodes"]
+	__slots__ = ["moves", "priors", "visits", "total_values", "children_nodes",
+	             "value"]
 
 	def __init__(self):
 		self.moves = []
@@ -47,6 +80,10 @@ class MCTSNode:
 		self.visits = None          # np.int32[N]
 		self.total_values = None    # np.float32[N]
 		self.children_nodes = []    # list[MCTSNode | None]
+		# The net's own value for this position, side-to-move POV.  Kept so
+		# first-play urgency can be anchored to a clean evaluation instead of
+		# the running edge mean, which carries in-flight virtual loss.
+		self.value = 0.0
 
 	@property
 	def expanded(self):
@@ -64,13 +101,19 @@ class MCTS:
 	"""
 
 	def __init__(self, model, device, num_simulations=800, c_puct=1.5,
-	             batch_size=1):
+	             batch_size=1, fpu_reduction=0.25, dirichlet_alpha=0.3,
+	             dirichlet_eps=0.25):
 		self.model = model
 		self.device = device
 		self.num_simulations = num_simulations
 		self.c_puct = c_puct
 		self.batch_size = max(1, int(batch_size))
-		self._use_ext = _ext.AVAILABLE
+		# First-play urgency: the Q value handed to a child that has never been
+		# visited, expressed as (parent Q - fpu_reduction).  See _select_child.
+		self.fpu_reduction = float(fpu_reduction)
+		self.dirichlet_alpha = float(dirichlet_alpha)
+		self.dirichlet_eps = float(dirichlet_eps)
+		self._use_ext = _ext.AVAILABLE and _EXT_HAS_FPU
 		# Inputs are encoded as float32 on the host; cast to whatever dtype the
 		# model expects (fp16 self-play clones run ~10% faster on MPS).
 		try:
@@ -149,9 +192,11 @@ class MCTS:
 	# Tree operations
 	# ------------------------------------------------------------------
 
-	def _expand(self, node, policy, legal_moves, indices, add_noise=False):
+	def _expand(self, node, policy, legal_moves, indices, add_noise=False,
+	            node_value=0.0):
 		"""Populate *node* with legal children priors drawn from *policy*."""
 		n = len(legal_moves)
+		node.value = float(node_value)
 		priors = policy[indices].astype(np.float32, copy=False)
 		prior_sum = float(priors.sum())
 		if prior_sum > 0:
@@ -159,9 +204,11 @@ class MCTS:
 		else:
 			priors = np.full(n, 1.0 / n, dtype=np.float32)
 
-		if add_noise and n > 0:
-			noise = np.random.dirichlet([0.3] * n).astype(np.float32)
-			priors = 0.75 * priors + 0.25 * noise
+		if add_noise and n > 0 and self.dirichlet_eps > 0.0:
+			noise = np.random.dirichlet(
+				[self.dirichlet_alpha] * n).astype(np.float32)
+			eps = self.dirichlet_eps
+			priors = (1.0 - eps) * priors + eps * noise
 
 		node.moves = list(legal_moves)
 		node.priors = priors
@@ -170,22 +217,38 @@ class MCTS:
 		node.children_nodes = [None] * n
 
 	def _select_child(self, node):
-		"""Pick the child that maximises Q + U (PUCT) and return its index."""
-		if self._use_ext:
-			return _ext.impl.puct_select(
-				node.priors, node.visits, node.total_values, self.c_puct,
-			)
+		"""Pick the child that maximises Q + U (PUCT) and return its index.
+
+		Unvisited children get ``parent_Q - fpu_reduction`` rather than 0.
+		Handing them a flat 0 treats every unexplored move as an even game,
+		which in a lost position looks better than any explored move and in a
+		won position looks worse than all of them — either way PUCT keeps
+		peeling off to fresh moves and the visit counts end up nearly uniform.
+		Since the visit distribution *is* the policy training target, a flat
+		search means a flat target, the net learns flat priors, and the whole
+		self-play loop settles into a fixed point where nothing sharpens.
+		"""
 		visits = node.visits
 		total_values = node.total_values
-		priors = node.priors
 		total = int(visits.sum())
+		# Anchor on the node's own NN value rather than the mean over its edges:
+		# during a batched descent every traversed edge carries +1.0 of virtual
+		# loss, so an edge mean taken mid-batch can sit near -1 and would drive
+		# the FPU baseline far below anything real.
+		fpu = node.value - self.fpu_reduction
+
+		if self._use_ext:
+			return _ext.impl.puct_select(
+				node.priors, visits, total_values, self.c_puct, fpu,
+			)
+		priors = node.priors
 		sqrt_total = math.sqrt(total + 1)
 
 		best_score = -float("inf")
 		best = 0
 		for i in range(len(priors)):
 			v = int(visits[i])
-			q = 0.0 if v == 0 else -(float(total_values[i]) / v)
+			q = fpu if v == 0 else -(float(total_values[i]) / v)
 			u = self.c_puct * float(priors[i]) * sqrt_total / (1 + v)
 			s = q + u
 			if s > best_score:
@@ -209,7 +272,7 @@ class MCTS:
 		root = MCTSNode()
 
 		# Expand root (single NN call — only once per search).
-		policy, _ = self.evaluate(board)
+		policy, root_value = self.evaluate(board)
 		legal_moves, indices = get_legal_move_indices(board)
 
 		# Fast path: forced move
@@ -218,7 +281,8 @@ class MCTS:
 			target[indices[0]] = 1.0
 			return legal_moves[0], target
 
-		self._expand(root, policy, legal_moves, indices, add_noise=add_noise)
+		self._expand(root, policy, legal_moves, indices, add_noise=add_noise,
+		             node_value=root_value)
 		root_indices = list(indices)
 
 		# ----- simulations (batched with virtual loss when batch_size>1) -----
@@ -279,7 +343,9 @@ class MCTS:
 					if not leaf_node.expanded:
 						leaf_legal, leaf_idx = get_legal_move_indices(leaf_boards[i])
 						if leaf_legal:
-							self._expand(leaf_node, policies[bidx], leaf_legal, leaf_idx)
+							self._expand(leaf_node, policies[bidx], leaf_legal,
+							             leaf_idx,
+							             node_value=float(values_np[bidx]))
 					leaf_terminal_values[i] = float(values_np[bidx])
 
 			# Phase 3 — backprop: remove virtual loss and apply real value.

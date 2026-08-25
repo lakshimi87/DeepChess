@@ -338,6 +338,33 @@ def run_suite(model, device, sims, depth=3):
 	return res, cats
 
 
+def score_model(model, device, sims):
+	"""Neural-only score on the ground-truth suite: ``(passed, total, breakdown)``.
+
+	:func:`run_suite` also runs the classical engine on every position, which
+	is pure waste when all that is wanted is a progress number for the net.
+
+	This is the metric to trend across a training run.  Unlike an arena match
+	it is an *absolute* yardstick: it cannot drift with the opponent, and it
+	has no promotion ratchet to launder noise into apparent progress.
+	"""
+	passed = total = 0
+	breakdown = {}
+	for cat, fen, acceptable, _desc in MOVE_TESTS:
+		ok = int(neural_move(model, device, fen, sims)["uci"] in acceptable)
+		p, t = breakdown.get(cat, (0, 0))
+		breakdown[cat] = (p + ok, t + 1)
+		passed += ok
+		total += 1
+	ep = et = 0
+	for fen, expected, _desc in EVAL_TESTS:
+		ep += int(_eval_ok(neural_eval(model, device, fen), expected,
+		                   chess.Board(fen).turn))
+		et += 1
+	breakdown["Eval"] = (ep, et)
+	return passed + ep, total + et, breakdown
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Pretty printing
 # ═══════════════════════════════════════════════════════════════════════

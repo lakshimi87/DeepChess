@@ -200,12 +200,21 @@ static py::array_t<float> encode_board(
 // maximum Q + U where
 //   Q = -total_value / visits   (negated: stored from child's POV)
 //   U = c_puct * prior * sqrt(sum_visits + 1) / (1 + visits)
+//
+// *fpu_value* is the Q assigned to a child with zero visits ("first-play
+// urgency").  Using 0.0 makes every unexplored move look like a dead draw,
+// which is wildly optimistic in a losing position and wildly pessimistic in a
+// winning one; either way the search stops discriminating and spreads its
+// visits almost uniformly, so the visit-count training target carries almost
+// no information.  The caller passes the parent's own Q minus a reduction
+// instead, which is the standard fix.
 
 static int puct_select(
 	py::array_t<float, py::array::c_style | py::array::forcecast> priors,
 	py::array_t<int32_t, py::array::c_style | py::array::forcecast> visits,
 	py::array_t<float, py::array::c_style | py::array::forcecast> total_values,
-	float c_puct
+	float c_puct,
+	float fpu_value
 ) {
 	ssize_t n = priors.shape(0);
 	const float*   p_arr = priors.data();
@@ -220,7 +229,7 @@ static int puct_select(
 	float best_score = -std::numeric_limits<float>::infinity();
 	for (ssize_t i = 0; i < n; ++i) {
 		int32_t v = v_arr[i];
-		float q = (v == 0) ? 0.0f : -(t_arr[i] / static_cast<float>(v));
+		float q = (v == 0) ? fpu_value : -(t_arr[i] / static_cast<float>(v));
 		float u = c_puct * p_arr[i] * sqrt_total / (1.0f + static_cast<float>(v));
 		float s = q + u;
 		if (s > best_score) { best_score = s; best = static_cast<int>(i); }
@@ -250,6 +259,7 @@ PYBIND11_MODULE(chess_ext, m) {
 	      "bitboards (12 piece + 4 castling + 1 ep + 1 indicator + 2 clocks).");
 	m.def("puct_select", &puct_select,
 	      py::arg("priors"), py::arg("visits"), py::arg("total_values"),
-	      py::arg("c_puct"),
-	      "Return the argmax-PUCT child index over parallel node arrays.");
+	      py::arg("c_puct"), py::arg("fpu_value") = 0.0f,
+	      "Return the argmax-PUCT child index over parallel node arrays.  "
+	      "fpu_value is the Q given to unvisited children.");
 }
