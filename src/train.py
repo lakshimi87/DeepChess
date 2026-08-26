@@ -397,6 +397,20 @@ def main():
 	                    help="Base RNG seed; worker r uses seed + r*7919")
 	parser.add_argument("--max-moves", type=int, default=512,
 	                    help="Maximum moves per self-play game")
+	parser.add_argument("--resign-threshold", type=float, default=-0.9,
+	                    help="Resign when the mover's own root Q stays at or "
+	                         "below this for --resign-plies of its own turns. "
+	                         "0 or above disables resignation. Decided games "
+	                         "that instead grind to the 50-move rule are "
+	                         "scored as draws, which mislabels every position "
+	                         "in them")
+	parser.add_argument("--resign-plies", type=int, default=2,
+	                    help="Consecutive turns by one side below "
+	                         "--resign-threshold before it resigns")
+	parser.add_argument("--resign-disable-frac", type=float, default=0.1,
+	                    help="Fraction of self-play games that ignore "
+	                         "resignation and play on; the only way to see a "
+	                         "false positive, so keep it above 0")
 	parser.add_argument("--batch-size", type=int, default=256,
 	                    help="Training batch size")
 	parser.add_argument("--sample-reuse", type=float, default=3.0,
@@ -648,6 +662,9 @@ def main():
 		"mcts_batch": args.mcts_batch,
 		"max_moves": args.max_moves,
 		"value_discount": args.value_discount,
+		"resign_threshold": args.resign_threshold,
+		"resign_plies": args.resign_plies,
+		"resign_disable_frac": args.resign_disable_frac,
 		"fpu_reduction": args.fpu_reduction,
 		"dirichlet_alpha": args.dirichlet_alpha,
 		"dirichlet_eps": args.dirichlet_eps,
@@ -681,6 +698,8 @@ def main():
 			iter_examples = []
 			done = 0
 			moves_total = 0
+			resigned = 0
+			truncated = 0
 			t0 = time.time()
 			width = len(str(args.games_per_iter))
 			for examples, result, moves, secs in pool.play(
@@ -689,6 +708,10 @@ def main():
 				iter_examples.extend(examples)
 				done += 1
 				moves_total += moves
+				if result.endswith("R"):
+					resigned += 1
+				elif result == "*":
+					truncated += 1
 				print(f"  Game {done:>{width}}/{args.games_per_iter}  "
 				      f"moves={moves:<4} result={result:<7} "
 				      f"{secs:5.1f}s")
@@ -699,6 +722,16 @@ def main():
 			print(f"Self-play done in {elapsed:.1f}s  "
 			      f"({done} games, {moves_total} moves, {mps_:.1f} moves/s)  |  "
 			      f"Buffer: {len(replay_buffer)} positions")
+			if done:
+				# Truncated games are the ones still labelled a draw despite
+				# being decided — the noise resignation is there to remove.
+				# Watch it fall as the value head becomes usable; if it stays
+				# high the threshold is never being reached and the value head
+				# is still the bottleneck.
+				print(f"  Game endings  : resigned {resigned}/{done} "
+				      f"({resigned / done * 100:.0f}%)  "
+				      f"hit move limit {truncated}/{done} "
+				      f"({truncated / done * 100:.0f}%)")
 
 			pstats = policy_target_stats(iter_examples)
 			vstats = value_target_stats(iter_examples)

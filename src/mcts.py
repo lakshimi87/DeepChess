@@ -113,6 +113,12 @@ class MCTS:
 		self.fpu_reduction = float(fpu_reduction)
 		self.dirichlet_alpha = float(dirichlet_alpha)
 		self.dirichlet_eps = float(dirichlet_eps)
+		# Root evaluation from the most recent search(), side-to-move POV.
+		# Kept as attributes rather than extra return values so the existing
+		# search() call sites keep their two-value unpacking.  Read straight
+		# after a search — self-play's resignation check is the only consumer.
+		self.root_value = 0.0   # the net's own value for the root position
+		self.root_q = 0.0       # visit-weighted mean over the root's edges
 		self._use_ext = _ext.AVAILABLE and _EXT_HAS_FPU
 		# Inputs are encoded as float32 on the host; cast to whatever dtype the
 		# model expects (fp16 self-play clones run ~10% faster on MPS).
@@ -266,6 +272,8 @@ class MCTS:
 		*policy_target* is a numpy array (NUM_MOVES,) with the visit-count
 		distribution — used as the training target.
 		"""
+		self.root_value = self.root_q = 0.0
+
 		if board.is_game_over():
 			return None, np.zeros(NUM_MOVES, dtype=np.float32)
 
@@ -274,6 +282,9 @@ class MCTS:
 		# Expand root (single NN call — only once per search).
 		policy, root_value = self.evaluate(board)
 		legal_moves, indices = get_legal_move_indices(board)
+		# Seed both with the raw net value so the forced-move and zero-visit
+		# fast paths below still leave a meaningful root evaluation behind.
+		self.root_value = self.root_q = float(root_value)
 
 		# Fast path: forced move
 		if len(legal_moves) == 1:
@@ -358,9 +369,16 @@ class MCTS:
 
 			sims_done += this_batch
 
+		# ----- root value after search -----
+		# total_values accumulate from the *child's* POV (see _select_child), so
+		# the root's own Q is the negated visit-weighted mean.  Virtual loss is
+		# fully unwound by the time the loop above exits, so this is clean.
+		total_visits = int(root.visits.sum())
+		if total_visits > 0:
+			self.root_q = -float(root.total_values.sum()) / total_visits
+
 		# ----- build policy target from visit counts -----
 		policy_target = np.zeros(NUM_MOVES, dtype=np.float32)
-		total_visits = int(root.visits.sum())
 		if total_visits == 0:
 			for m, pidx in zip(legal_moves, root_indices):
 				policy_target[pidx] = 1.0 / len(legal_moves)

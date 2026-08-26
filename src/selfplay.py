@@ -49,15 +49,38 @@ from .model import ChessNet
 # ---------------------------------------------------------------------------
 
 def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
-              temp_high=1.0, temp_low=0.1):
+              temp_high=1.0, temp_low=0.1, resign_threshold=0.0,
+              resign_plies=2, resign_disable_frac=0.1):
 	"""Play one self-play game with *mcts* and return (examples, result).
 
 	*mcts* is reused across games — :meth:`MCTS.search` builds a fresh root
 	every call, so there is no state to reset, and reusing it keeps the pinned
 	staging buffer alive instead of reallocating it once per game.
+
+	**Resignation.**  A side resigns once its own root Q has stayed at or below
+	*resign_threshold* for *resign_plies* consecutive turns of its own.  This is
+	not primarily a speed optimisation: a decided game that plays on to the
+	50-move rule is scored a *draw*, so every one of its several hundred
+	positions gets a 0.0 value label that contradicts the result the position
+	actually deserves.  That is the single largest source of value-label noise
+	in a weak-net loop, and it is what drives held-out value MSE above the
+	predict-a-draw baseline.  Resignation is off when *resign_threshold* is
+	>= 0.
+
+	A *resign_disable_frac* share of games ignore resignation and play to the
+	end.  Those games are the only way to see a false positive — a position
+	resigned at -0.9 that was in fact holdable — so the fraction is what keeps
+	the threshold auditable rather than self-confirming.
 	"""
 	board = chess.Board()
 	history = []  # (encoded_state, policy, turn)
+
+	resign_enabled = (resign_threshold < 0.0
+	                  and np.random.random() >= resign_disable_frac)
+	# Counted per colour: the root Q alternates POV every ply, so a single
+	# counter would trip on two *different* sides each thinking they are lost.
+	bad_turns = {chess.WHITE: 0, chess.BLACK: 0}
+	resigned_by = None
 
 	move_count = 0
 	while not board.is_game_over() and move_count < max_moves:
@@ -67,10 +90,24 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 		if move is None:
 			break
 		history.append((state, policy, board.turn))
+		mover = board.turn
 		board.push(move)
 		move_count += 1
 
-	if board.is_checkmate():
+		if resign_enabled:
+			# root_q is from the POV of the side that was about to move, i.e.
+			# `mover` — read it after the push, but attribute it to `mover`.
+			if mcts.root_q <= resign_threshold:
+				bad_turns[mover] += 1
+				if bad_turns[mover] >= resign_plies:
+					resigned_by = mover
+					break
+			else:
+				bad_turns[mover] = 0
+
+	if resigned_by is not None:
+		winner = not resigned_by
+	elif board.is_checkmate():
 		winner = not board.turn  # side to move is mated
 	else:
 		winner = None  # draw (or truncated at max_moves)
@@ -88,7 +125,13 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 			value *= value_discount ** (total - i)
 		examples.append((state, policy, value))
 
-	return examples, board.result()
+	if resigned_by is not None:
+		# board.result() is "*" here — the game is decided but not over.
+		# The trailing R keeps the resignation rate greppable in the log.
+		result = "1-0 R" if winner == chess.WHITE else "0-1 R"
+	else:
+		result = board.result()
+	return examples, result
 
 
 def play_match(mcts_cur, mcts_ref, cur_is_white, max_moves=512,
@@ -247,6 +290,9 @@ def _worker(rank, task_q, result_q, cfg):
 					mcts,
 					max_moves=cfg["max_moves"],
 					value_discount=cfg["value_discount"],
+					resign_threshold=cfg.get("resign_threshold", 0.0),
+					resign_plies=cfg.get("resign_plies", 2),
+					resign_disable_frac=cfg.get("resign_disable_frac", 0.1),
 				)
 				result_q.put(("game", game_id, examples, result,
 				              len(examples), time.perf_counter() - t0))
