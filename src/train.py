@@ -457,16 +457,36 @@ def main():
 	                         "the value head with ~3%% of the gradient, which is "
 	                         "backwards when the value head is what MCTS needs "
 	                         "to tell moves apart.")
+	parser.add_argument("--search-value-weight", type=float, default=0.35,
+	                    help="Fraction of each position's value target taken "
+	                         "from its own MCTS root Q instead of the game "
+	                         "outcome.  A pure outcome label is identical for "
+	                         "every position in a game, so with ~57%% draws "
+	                         "the constant 0.0 minimises the loss and the "
+	                         "value head converges to it.  Root Q varies "
+	                         "ply to ply, which removes that fixed point.  "
+	                         "Only meaningful once the value head carries "
+	                         "signal — set 0 when training from a random "
+	                         "init, non-zero after src/pretrain.py.  Games "
+	                         "truncated at --max-moves always take the search "
+	                         "value outright: they are unfinished, not drawn.")
 	parser.add_argument("--value-discount", type=float, default=1.0,
 	                    help="Per-move discount applied to value targets "
 	                         "(1.0 = AlphaZero paper; <1 weakens early-game "
 	                         "signal where the game outcome is noisier).")
-	parser.add_argument("--buffer-size", type=int, default=200000,
-	                    help="Replay buffer capacity (positions).  At 50k and "
-	                         "~11k new positions per iteration the buffer turned "
-	                         "over completely every ~4 iterations and held only "
-	                         "~215 distinct games, so consecutive gradient steps "
-	                         "saw heavily correlated data.")
+	parser.add_argument("--buffer-size", type=int, default=1000000,
+	                    help="Replay buffer capacity (positions).  This is the "
+	                         "loop's largest single deficit against a working "
+	                         "AlphaZero run: AlphaGo Zero sampled from its most "
+	                         "recent 500,000 *games*, while a 100k-position "
+	                         "window here holds ~820 -- three orders of "
+	                         "magnitude less diversity, so consecutive gradient "
+	                         "steps see nearly the same data and the value head "
+	                         "memorises it (run4 held-out value MSE ran 2x its "
+	                         "training MSE for 258 iterations).  Unlike every "
+	                         "other axis of that gap, this one costs RAM rather "
+	                         "than GPU time: at ~24k new positions per "
+	                         "iteration, 1M holds ~40 iterations for a few GB.")
 	parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINTS_DIR,
 	                    help="Directory for model checkpoints")
 	parser.add_argument("--checkpoint-every", type=int, default=10,
@@ -662,6 +682,7 @@ def main():
 		"mcts_batch": args.mcts_batch,
 		"max_moves": args.max_moves,
 		"value_discount": args.value_discount,
+		"search_value_weight": args.search_value_weight,
 		"resign_threshold": args.resign_threshold,
 		"resign_plies": args.resign_plies,
 		"resign_disable_frac": args.resign_disable_frac,

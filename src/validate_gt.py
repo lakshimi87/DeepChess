@@ -14,6 +14,7 @@ how well the model has learned.
 
 import argparse
 import glob
+import json
 import math
 import os
 import sys
@@ -185,6 +186,46 @@ EVAL_TESTS = [
 ]
 
 
+# The 27 tests above are hand-written and stay as the core.  A generated
+# suite (tools/build_gt_suite.py) extends them when present: 27 positions put
+# one sigma at +/-9.6 points, which is wider than any effect a training run
+# produces, so run4's 41%-63% swing over 258 iterations was indistinguishable
+# from noise.  Loading happens at import so the training loop's periodic
+# score_model() call measures against the same suite validate_gt.sh does.
+
+CORE_MOVE_TESTS = len(MOVE_TESTS)
+CORE_EVAL_TESTS = len(EVAL_TESTS)
+SUITE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "resources", "gt_suite.json")
+SUITE_META = None
+
+
+def load_generated_suite(path=None):
+	"""Append the generated suite to the built-in tests.  Idempotent."""
+	global SUITE_META
+	path = path or SUITE_PATH
+	del MOVE_TESTS[CORE_MOVE_TESTS:]
+	del EVAL_TESTS[CORE_EVAL_TESTS:]
+	SUITE_META = None
+	if not os.path.exists(path):
+		return 0
+	try:
+		with open(path) as fh:
+			suite = json.load(fh)
+	except (OSError, ValueError) as e:
+		print(f"warning: could not read {path}: {e}", file=sys.stderr)
+		return 0
+	for t in suite.get("move_tests", []):
+		MOVE_TESTS.append((t["category"], t["fen"], t["moves"], t["desc"]))
+	for t in suite.get("eval_tests", []):
+		EVAL_TESTS.append((t["fen"], t["expected"], t["desc"]))
+	SUITE_META = suite.get("meta")
+	return len(suite.get("move_tests", [])) + len(suite.get("eval_tests", []))
+
+
+load_generated_suite()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════
@@ -292,11 +333,16 @@ def _ordered_categories():
 	return cats
 
 
-def run_suite(model, device, sims, depth=3):
+def run_suite(model, device, sims, depth=3, with_classical=True):
 	"""Run every test.  Returns ``(results_dict, categories)``.
 
 	Each entry in ``res['nm'][cat]`` / ``res['cm'][cat]`` is a dict with
 	keys: ok, san, uci, exp, desc, dt, n_legal, and (neural only) top, val.
+
+	*with_classical* runs the pure-Python minimax baseline alongside the net.
+	It costs roughly half a second per position, which is nothing across the
+	27 hand-written tests and several minutes across a generated suite, so
+	the caller turns it off once the suite is large.
 	"""
 	cats = _ordered_categories()
 	res = dict(nm={}, cm={}, ne=[], ce=[])
@@ -316,14 +362,15 @@ def run_suite(model, device, sims, depth=3):
 				top=nm["top"], val=nm["val"],
 			))
 
-		t0 = time.time()
-		uci, san = classical_move(fen, depth)
-		dt = time.time() - t0
-		ok = (uci in acceptable) if uci else False
-		res["cm"].setdefault(cat, []).append(dict(
-			ok=ok, san=san, uci=uci, exp=exp_san,
-			desc=desc, dt=dt, n_legal=n_legal,
-		))
+		if with_classical:
+			t0 = time.time()
+			uci, san = classical_move(fen, depth)
+			dt = time.time() - t0
+			ok = (uci in acceptable) if uci else False
+			res["cm"].setdefault(cat, []).append(dict(
+				ok=ok, san=san, uci=uci, exp=exp_san,
+				desc=desc, dt=dt, n_legal=n_legal,
+			))
 
 	for fen, expected, desc in EVAL_TESTS:
 		board = chess.Board(fen)
@@ -331,9 +378,10 @@ def run_suite(model, device, sims, depth=3):
 			v = neural_eval(model, device, fen)
 			ok = _eval_ok(v, expected, board.turn)
 			res["ne"].append(dict(ok=ok, val=v, exp=expected, desc=desc))
-		v = classical_eval(fen)
-		ok = _eval_ok(v, expected, board.turn)
-		res["ce"].append(dict(ok=ok, val=v, exp=expected, desc=desc))
+		if with_classical:
+			v = classical_eval(fen)
+			ok = _eval_ok(v, expected, board.turn)
+			res["ce"].append(dict(ok=ok, val=v, exp=expected, desc=desc))
 
 	return res, cats
 
@@ -718,7 +766,30 @@ def main():
 	ap.add_argument("--games", type=int, default=20,
 	                help="Play this many games against the classical engine "
 	                     "(0 to skip)")
+	ap.add_argument("--core-only", action="store_true",
+	                help="Use only the 27 hand-written tests, ignoring any "
+	                     "generated suite in resources/.  Fast, but one sigma "
+	                     "is +/-9.6 points — too coarse to read a training "
+	                     "run's progress from.")
+	ap.add_argument("--suite", default=None,
+	                help="Path to a generated suite JSON "
+	                     "(default: resources/gt_suite.json)")
+	ap.add_argument("--classical", dest="classical", default=None,
+	                action="store_true",
+	                help="Force the classical baseline on.  It is on by "
+	                     "default for the 27 hand-written tests and off for a "
+	                     "generated suite, where its ~0.5s/position would add "
+	                     "several minutes without changing what the net scores.")
+	ap.add_argument("--no-classical", dest="classical", action="store_false")
+	ap.add_argument("--detail", action="store_true",
+	                help="Print every test individually.  Off by default: a "
+	                     "generated suite runs to hundreds of positions.")
 	args = ap.parse_args()
+
+	if args.core_only:
+		load_generated_suite("")
+	elif args.suite:
+		load_generated_suite(args.suite)
 
 	device = get_device()
 
@@ -728,6 +799,17 @@ def main():
 	print(f"  Device           : {device}")
 	print(f"  MCTS simulations : {args.simulations}")
 	print(f"  Classical depth  : {args.depth}")
+	n_tests = len(MOVE_TESTS) + len(EVAL_TESTS)
+	sigma = 50 / n_tests ** 0.5
+	origin = ("hand-written only" if SUITE_META is None
+	          else f"{CORE_MOVE_TESTS + CORE_EVAL_TESTS} hand-written + "
+	               f"{n_tests - CORE_MOVE_TESTS - CORE_EVAL_TESTS} generated "
+	               f"@ depth {SUITE_META.get('stockfish_depth', '?')}")
+	# Printed with the suite because a score is unreadable without it: the
+	# whole reason this suite was enlarged is that 27 tests could not tell a
+	# real gain from a coin flip.
+	print(f"  Test positions   : {n_tests} ({origin})")
+	print(f"                     1 sigma on a 50% scorer: +/-{sigma:.1f} points")
 
 	# Load model
 	model = None
@@ -748,14 +830,23 @@ def main():
 		print(f"                     Running classical engine only.")
 
 	# Run
+	with_classical = args.classical
+	if with_classical is None:
+		with_classical = n_tests <= 100
+	if not with_classical:
+		print(f"  Classical engine : skipped ({n_tests} tests; "
+		      f"pass --classical to include it)")
+
 	t0 = time.time()
-	results, cats = run_suite(model, device, args.simulations, args.depth)
+	results, cats = run_suite(model, device, args.simulations, args.depth,
+	                          with_classical=with_classical)
 	elapsed = time.time() - t0
 
 	has_neural = model is not None
-	print_detail(results, cats, has_neural)
+	if args.detail:
+		print_detail(results, cats, has_neural)
 	n_pass, n_total = print_summary(results, cats, has_neural)
-	if has_neural:
+	if has_neural and with_classical:
 		print_comparison(results, cats)
 	print(f"\n  Completed in {elapsed:.1f}s")
 

@@ -218,3 +218,14 @@ __marimo__/
 # Archived training runs (checkpoints + logs) — large, keep out of git.
 archive/
 nohup.out
+
+# Bootstrap corpus: Lichess PGN dumps, extracted positions, Stockfish labels.
+# Tens of GB and fully reproducible from tools/download_lichess.sh +
+# tools/extract_all.sh + tools/label_sf.py.
+data/
+
+# Stockfish binary fetched by hand for labelling — not ours to vendor.
+third_party/
+
+# Pidfiles for the unattended pipeline (tools/status.sh).
+.run/

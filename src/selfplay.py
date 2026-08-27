@@ -50,7 +50,8 @@ from .model import ChessNet
 
 def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
               temp_high=1.0, temp_low=0.1, resign_threshold=0.0,
-              resign_plies=2, resign_disable_frac=0.1):
+              resign_plies=2, resign_disable_frac=0.1,
+              search_value_weight=0.0):
 	"""Play one self-play game with *mcts* and return (examples, result).
 
 	*mcts* is reused across games — :meth:`MCTS.search` builds a fresh root
@@ -71,9 +72,26 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	end.  Those games are the only way to see a false positive — a position
 	resigned at -0.9 that was in fact holdable — so the fraction is what keeps
 	the threshold auditable rather than self-confirming.
+
+	**Value targets.**  A pure game-outcome label is the same number for every
+	position in a game, so in a corpus that is ~57% draws the constant 0.0 is
+	genuinely the loss-minimising prediction and the value head converges to
+	it.  *search_value_weight* blends in each position's own root Q, which
+	differs from ply to ply, so two drawn games stop sharing one label and the
+	constant stops being optimal.
+
+	The blend is self-referential — root Q comes from the value head being
+	trained — so it only helps once that head already carries signal.  Run it
+	at 0.0 from a random initialisation and it reinforces the net's own noise;
+	the intended use is after supervised pre-training (see src/pretrain.py).
+
+	Games cut off at *max_moves* are the one case that takes the search value
+	outright.  Those are not draws — they are unfinished — and labelling
+	several hundred of their positions 0.0 is the single largest source of
+	value-label noise left once resignation is on.
 	"""
 	board = chess.Board()
-	history = []  # (encoded_state, policy, turn)
+	history = []  # (encoded_state, policy, turn, root_q)
 
 	resign_enabled = (resign_threshold < 0.0
 	                  and np.random.random() >= resign_disable_frac)
@@ -89,7 +107,10 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 		move, policy = mcts.search(board, temperature=temperature, add_noise=True)
 		if move is None:
 			break
-		history.append((state, policy, board.turn))
+		# Read root_q before the push: it is the search's evaluation of *this*
+		# position from the mover's point of view, the same perspective the
+		# outcome label uses.
+		history.append((state, policy, board.turn, mcts.root_q))
 		mover = board.turn
 		board.push(move)
 		move_count += 1
@@ -112,9 +133,15 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	else:
 		winner = None  # draw (or truncated at max_moves)
 
+	# A game that ran out of moves is unfinished, not drawn.  Its outcome
+	# label carries no information at all, so the search value replaces it
+	# rather than being blended with it.
+	truncated = (resigned_by is None and not board.is_game_over()
+	             and move_count >= max_moves)
+
 	examples = []
 	total = len(history)
-	for i, (state, policy, player) in enumerate(history):
+	for i, (state, policy, player, root_q) in enumerate(history):
 		if winner is None:
 			value = 0.0
 		elif winner == player:
@@ -123,6 +150,11 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 			value = -1.0
 		if value_discount < 1.0:
 			value *= value_discount ** (total - i)
+		if truncated:
+			value = root_q
+		elif search_value_weight > 0.0:
+			value = ((1.0 - search_value_weight) * value
+			         + search_value_weight * root_q)
 		examples.append((state, policy, value))
 
 	if resigned_by is not None:
@@ -293,6 +325,7 @@ def _worker(rank, task_q, result_q, cfg):
 					resign_threshold=cfg.get("resign_threshold", 0.0),
 					resign_plies=cfg.get("resign_plies", 2),
 					resign_disable_frac=cfg.get("resign_disable_frac", 0.1),
+					search_value_weight=cfg.get("search_value_weight", 0.0),
 				)
 				result_q.put(("game", game_id, examples, result,
 				              len(examples), time.perf_counter() - t0))
