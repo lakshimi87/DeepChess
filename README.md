@@ -175,6 +175,17 @@ cp checkpoints/pretrained.pt checkpoints/latest.pt
 ./train.sh --search-value-weight 0.35 --buffer-size 1000000
 ```
 
+`latest.pt` is the only checkpoint `play.sh` and `src/engine.py` look for, and
+nothing writes it except `src/train.py` and that `cp`.  `next_round.sh` writes
+`checkpoints/pretrained_<tag>.pt` instead, so after a round ladder finishes,
+re-point it by hand at the round you actually want to play or resume from —
+otherwise the engine silently keeps serving whichever net was copied last:
+
+```bash
+cp checkpoints/pretrained_70M.pt checkpoints/latest.pt   # strongest round so far
+python -m src.validate_gt --games 0                      # confirm it is the one you meant
+```
+
 ### Why the labelling is configured the way it is
 
 **`--depth 14 --multipv 1`.**  Measured on a 20-core i7-14700F, multipv is by
