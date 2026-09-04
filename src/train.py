@@ -179,8 +179,32 @@ def _atomic_save(payload, path):
 		raise
 
 
+def checkpoint_payload(model, optimizer, scheduler, iteration,
+                      num_res_blocks, num_filters, generation=0,
+                      optimizer_name=""):
+	"""The dict every checkpoint in this project stores.
+
+	``optimizer_name`` is recorded so a resume can tell whether the saved
+	optimiser state belongs to the optimiser now being built.  Without it,
+	switching --optimizer silently loaded one optimiser's moments into
+	another's slots, or dropped them and started at full step size on a net
+	that had converged at a thousandth of it.
+	"""
+	return {
+		"model_state_dict": model.state_dict(),
+		"optimizer_state_dict": optimizer.state_dict(),
+		"scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+		"iteration": iteration,
+		"num_res_blocks": num_res_blocks,
+		"num_filters": num_filters,
+		"generation": generation,
+		"optimizer": optimizer_name,
+	}
+
+
 def save_checkpoint(model, optimizer, scheduler, iteration, checkpoint_dir,
-                    num_res_blocks, num_filters, numbered=True, generation=0):
+                    num_res_blocks, num_filters, numbered=True, generation=0,
+                    optimizer_name=""):
 	"""Write ``latest.pt`` and (optionally) ``model_iter_XXXX.pt``.
 
 	``latest.pt`` is always refreshed so play.sh/resume always see the most
@@ -192,15 +216,10 @@ def save_checkpoint(model, optimizer, scheduler, iteration, checkpoint_dir,
 	to a partially written checkpoint.
 	"""
 	os.makedirs(checkpoint_dir, exist_ok=True)
-	payload = {
-		"model_state_dict": model.state_dict(),
-		"optimizer_state_dict": optimizer.state_dict(),
-		"scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-		"iteration": iteration,
-		"num_res_blocks": num_res_blocks,
-		"num_filters": num_filters,
-		"generation": generation,
-	}
+	payload = checkpoint_payload(
+		model, optimizer, scheduler, iteration, num_res_blocks, num_filters,
+		generation=generation, optimizer_name=optimizer_name,
+	)
 	if numbered:
 		numbered_path = os.path.join(checkpoint_dir, f"model_iter_{iteration:04d}.pt")
 		_atomic_save(payload, numbered_path)
@@ -213,7 +232,7 @@ def save_checkpoint(model, optimizer, scheduler, iteration, checkpoint_dir,
 
 def train_on_data(model, optimizer, device, replay_buffer,
                   batch_size=256, steps=0, epochs=1, value_weight=1.0,
-                  amp=True):
+                  amp=True, extra_examples=None):
 	"""Train on a random sample of the replay buffer.
 
 	*steps* fixes the number of gradient steps directly, so the amount of
@@ -238,14 +257,27 @@ def train_on_data(model, optimizer, device, replay_buffer,
 	because it has fp32's exponent range, so no GradScaler and no loss-scale
 	tuning is needed; the softmax/MSE reductions stay in fp32 either way since
 	autocast keeps them on its fp32 list.
+
+	*extra_examples* are mixed into the sample and count against the same step
+	budget, so adding them trades self-play data for anchor data rather than
+	buying extra gradient steps.  See --anchor-data-dir for why the loop needs
+	a target that is not a function of its own output.
 	"""
 	n = len(replay_buffer)
 	if n < batch_size:
 		return None
 
+	extra = list(extra_examples) if extra_examples else []
 	data = list(replay_buffer)
 	if steps > 0:
 		want = steps * batch_size
+		# Trim the anchor rather than growing the budget, and never let it
+		# crowd the replay buffer below one batch: self-play data is what the
+		# loop is supposed to be learning from, the anchor only holds it in
+		# place.
+		if extra:
+			extra = extra[:max(0, want - batch_size)]
+		want -= len(extra)
 		if want <= n:
 			idx = random.sample(range(n), want)
 		else:
@@ -254,6 +286,7 @@ def train_on_data(model, optimizer, device, replay_buffer,
 		epochs = 1
 	else:
 		random.shuffle(data)
+	data.extend(extra)
 
 	states = torch.from_numpy(np.array([d[0] for d in data], dtype=np.float32))
 	policies = torch.from_numpy(np.array([d[1] for d in data], dtype=np.float32))
@@ -325,6 +358,8 @@ def evaluate_examples(model, device, examples, batch_size=512, amp=True):
 	model.eval()
 	use_amp = amp and device.type == "cuda"
 	p_sum = v_sum = 0.0
+	abs_sum = 0.0
+	abs_max = 0.0
 	n = 0
 	with torch.no_grad():
 		for i in range(0, len(examples), batch_size):
@@ -339,17 +374,107 @@ def evaluate_examples(model, device, examples, batch_size=512, amp=True):
 				s = s.contiguous(memory_format=torch.channels_last)
 			with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
 				logits, pred = model(s)
+			pred_v = pred.float().squeeze(-1)
 			p_sum += float(-(p * F.log_softmax(logits.float(), dim=1)
 			                 ).sum(dim=1).sum())
-			v_sum += float(F.mse_loss(pred.float().squeeze(-1), v,
-			                          reduction="sum"))
+			v_sum += float(F.mse_loss(pred_v, v, reduction="sum"))
+			abs_sum += float(pred_v.abs().sum())
+			abs_max = max(abs_max, float(pred_v.abs().max()))
 			n += len(chunk)
 	vals = np.array([e[2] for e in examples], dtype=np.float32)
 	return {
 		"policy_loss": p_sum / n,
 		"value_loss": v_sum / n,
 		"value_baseline": float((vals ** 2).mean()),
+		# The value head's output *scale*, which no other number in the loop
+		# exposes.  A collapsing head keeps posting a falling value loss --
+		# converging on the degenerate constant looks exactly like learning --
+		# while mean|V| walks to zero.  It is also what decides whether an
+		# absolute resign threshold is still reachable at all.
+		"pred_abs_mean": abs_sum / n,
+		"pred_abs_max": abs_max,
 	}
+
+
+# ---------------------------------------------------------------------------
+# Supervised anchor
+# ---------------------------------------------------------------------------
+
+# Reproduce src/pretrain.py's targets exactly.  The anchor is only worth
+# anything if it is the same objective the net was pre-trained on; a
+# differently-shaped policy target would pull the head somewhere new rather
+# than holding it where the supervised phase left it.
+ANCHOR_SF_WEIGHT = 0.60
+ANCHOR_HUMAN_WEIGHT = 0.30
+ANCHOR_POLICY_FLOOR = 0.10
+ANCHOR_RESULT_WEIGHT = 0.15
+
+
+def load_anchor_dataset(data_dir, max_rows=0, seed=1234):
+	"""Index the Stockfish-labelled shards for use as a training anchor.
+
+	Every target in the self-play loop is a function of the net's own output:
+	the policy target is its search's visit counts, the value target is the
+	game its own moves produced, and the search value blended into that target
+	is literally its own value head.  Nothing in the loop is anchored to a
+	quantity from outside it, so once the net drifts there is no gradient
+	anywhere that pulls back — run5 lost 91% -> 38% on the ground-truth suite
+	while every loss it could see fell monotonically.
+
+	These shards are the one quantity in the project that does not move.
+	Mixing a fraction of them into every training step turns the supervised
+	solution from a starting point into a constraint.
+	"""
+	from .pretrain import LabelledPositions
+
+	paths = sorted(os.path.join(data_dir, f)
+	               for f in os.listdir(data_dir) if f.endswith(".tsv"))
+	if not paths:
+		raise SystemExit(f"No label shards in {data_dir}")
+	ds = LabelledPositions(paths, ANCHOR_SF_WEIGHT, ANCHOR_HUMAN_WEIGHT,
+	                       ANCHOR_POLICY_FLOOR, ANCHOR_RESULT_WEIGHT)
+	if max_rows and len(ds) > max_rows:
+		# The row index is ~12 bytes/row, so a full 70M-row corpus costs ~1 GB
+		# of resident memory next to a replay buffer that is already the
+		# largest allocation in the run.  Subsampling the index keeps the
+		# anchor's diversity far above anything self-play produces while
+		# bounding that cost.
+		rng = np.random.default_rng(seed)
+		keep = np.sort(rng.choice(len(ds), size=max_rows, replace=False))
+		ds = LabelledPositions(
+			paths, ANCHOR_SF_WEIGHT, ANCHOR_HUMAN_WEIGHT,
+			ANCHOR_POLICY_FLOOR, ANCHOR_RESULT_WEIGHT,
+			index=(ds.shard_id[keep], ds.offset[keep], ds.bucket[keep]))
+	return ds, len(paths)
+
+
+def sample_anchor(dataset, count):
+	"""Draw *count* random labelled positions in replay-buffer tuple form."""
+	if dataset is None or count <= 0:
+		return []
+	idx = np.random.randint(0, len(dataset), size=count)
+	return [dataset[int(i)] for i in idx]
+
+
+def ref_matches_arch(path, num_res_blocks, num_filters):
+	"""Whether the fp16 arena reference at *path* fits the current net.
+
+	``.arena_ref.pt`` is not versioned and not architecture-tagged, so a file
+	left behind by an earlier run of a different size sits there looking
+	valid.  run5 carried an 8x128 reference from run4 into a 16x192 run: the
+	arena would have killed every worker on a shape mismatch the first time it
+	fired, which is to say the one guard rail that could have caught the
+	collapse was broken before the run started.
+	"""
+	if not os.path.exists(path):
+		return False
+	try:
+		state = torch.load(path, map_location="cpu", weights_only=True)
+		probe = ChessNet(num_res_blocks=num_res_blocks, num_filters=num_filters)
+		probe.load_state_dict({k: v.float() for k, v in state.items()})
+	except Exception:
+		return False
+	return True
 
 
 # ---------------------------------------------------------------------------
@@ -408,9 +533,27 @@ def main():
 	                    help="Consecutive turns by one side below "
 	                         "--resign-threshold before it resigns")
 	parser.add_argument("--resign-disable-frac", type=float, default=0.1,
-	                    help="Fraction of self-play games that ignore "
-	                         "resignation and play on; the only way to see a "
-	                         "false positive, so keep it above 0")
+	                    help="Fraction of self-play games that ignore both "
+	                         "resignation and adjudication and play on; the "
+	                         "only way to see a false positive, so keep it "
+	                         "above 0")
+	parser.add_argument("--adjudicate-material", type=float, default=5.0,
+	                    help="Award the game to a side that has held this "
+	                         "material lead, in pawns, for "
+	                         "--adjudicate-plies plies.  0 disables.  This is "
+	                         "the only decisive-label source in the loop that "
+	                         "does not read the network: --resign-threshold is "
+	                         "an absolute root-Q bound, so it silently stops "
+	                         "firing the moment the value head's output scale "
+	                         "shrinks below it, and the draw-labelled games "
+	                         "that result are what feed the collapse.")
+	parser.add_argument("--adjudicate-plies", type=int, default=20,
+	                    help="Plies the material lead must persist before "
+	                         "adjudication fires.  Long enough that a "
+	                         "temporary sacrifice does not score the game, "
+	                         "short enough to stop a decided game grinding to "
+	                         "the 50-move rule and mislabelling every position "
+	                         "in it as a draw.")
 	parser.add_argument("--batch-size", type=int, default=256,
 	                    help="Training batch size")
 	parser.add_argument("--sample-reuse", type=float, default=3.0,
@@ -428,13 +571,36 @@ def main():
 	                         "times before ageing out, which fits the buffer "
 	                         "rather than the game.  Ignored unless "
 	                         "--sample-reuse is 0.")
-	parser.add_argument("--lr", type=float, default=0.02,
-	                    help="Initial learning rate (SGD+momentum).  Stepped "
-	                         "down by --lr-gamma at each --lr-milestones.")
+	parser.add_argument("--optimizer", choices=("sgd", "adamw"), default="sgd",
+	                    help="Optimiser for the training step.  Use adamw to "
+	                         "continue from src/pretrain.py, which is AdamW: "
+	                         "handing a net that converged under one optimiser "
+	                         "to another with no state and no warmup is a step "
+	                         "discontinuity, not a resume.")
+	parser.add_argument("--lr", type=float, default=None,
+	                    help="Initial learning rate.  Defaults to 0.02 for "
+	                         "sgd and 1e-4 for adamw — the sgd value is three "
+	                         "orders of magnitude above where pre-training "
+	                         "ends (OneCycle to 1e-5), so carrying it over "
+	                         "unchanged is what turned run5's collapse into a "
+	                         "single-iteration cliff.  Stepped down by "
+	                         "--lr-gamma at each --lr-milestones.")
+	parser.add_argument("--warmup-iters", type=int, default=0,
+	                    help="Ramp the LR linearly from 1/N to full over the "
+	                         "first N iterations.  Matters most on the first "
+	                         "iteration after pre-training, which trains on a "
+	                         "buffer holding one iteration of self-play — the "
+	                         "smallest and most correlated sample the run will "
+	                         "ever see, at the largest step size.")
 	parser.add_argument("--lr-milestones", type=int, nargs="+",
 	                    default=[1500, 3000, 4000],
 	                    help="Absolute iteration numbers at which to decay the "
-	                         "learning rate by --lr-gamma.  These are absolute, "
+	                         "learning rate by --lr-gamma, counted against the "
+	                         "iteration number the log prints — a milestone of "
+	                         "1500 first applies on the iteration labelled "
+	                         "1500.  (MultiStepLR, which this replaced, "
+	                         "applied it one iteration later.)  These are "
+	                         "absolute, "
 	                         "not relative to a resume, so once the last one is "
 	                         "behind you every further iteration runs at the "
 	                         "fully decayed rate — set them for the whole "
@@ -461,10 +627,16 @@ def main():
 	                    help="Fraction of each position's value target taken "
 	                         "from its own MCTS root Q instead of the game "
 	                         "outcome.  A pure outcome label is identical for "
-	                         "every position in a game, so with ~57%% draws "
-	                         "the constant 0.0 minimises the loss and the "
-	                         "value head converges to it.  Root Q varies "
-	                         "ply to ply, which removes that fixed point.  "
+	                         "every position in a game; root Q varies ply to "
+	                         "ply, so two decided games stop sharing one "
+	                         "label per side.  Applied to decided games only: "
+	                         "the MSE fixed point of a target "
+	                         "(1-w)*outcome + w*V is V = outcome whatever w "
+	                         "is, so on a draw this does not escape the "
+	                         "constant-0 fixed point, it only contracts V "
+	                         "toward 0 by w per iteration out of the net's own "
+	                         "output.  Keeping the draw rate down is "
+	                         "--adjudicate-material's job, not this flag's.  "
 	                         "Only meaningful once the value head carries "
 	                         "signal — set 0 when training from a random "
 	                         "init, non-zero after src/pretrain.py.  Games "
@@ -487,6 +659,26 @@ def main():
 	                         "other axis of that gap, this one costs RAM rather "
 	                         "than GPU time: at ~24k new positions per "
 	                         "iteration, 1M holds ~40 iterations for a few GB.")
+	parser.add_argument("--anchor-data-dir", type=str, default="",
+	                    help="Directory of Stockfish label shards (the "
+	                         "--data-dir given to src/pretrain.py) to mix into "
+	                         "every training step.  Every other target in the "
+	                         "loop is a function of the net's own output, so "
+	                         "nothing pulls the weights back once they drift; "
+	                         "these rows are the only fixed quantity "
+	                         "available, and they cost RAM and CPU rather than "
+	                         "GPU time.  Empty disables anchoring.")
+	parser.add_argument("--anchor-frac", type=float, default=0.25,
+	                    help="Fraction of each iteration's training sample "
+	                         "drawn from --anchor-data-dir instead of the "
+	                         "replay buffer.  Counts against the same step "
+	                         "budget, so this trades self-play data for anchor "
+	                         "data rather than adding steps.  Ignored without "
+	                         "--anchor-data-dir.")
+	parser.add_argument("--anchor-max-rows", type=int, default=8_000_000,
+	                    help="Cap on indexed anchor rows (~12 bytes each).  "
+	                         "0 indexes the whole corpus, which is ~1 GB of "
+	                         "resident index for a 70M-row one.")
 	parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINTS_DIR,
 	                    help="Directory for model checkpoints")
 	parser.add_argument("--checkpoint-every", type=int, default=10,
@@ -536,6 +728,18 @@ def main():
 	                         "drift with the opponent and has no ratchet.")
 	parser.add_argument("--gt-sims", type=int, default=200,
 	                    help="MCTS simulations per ground-truth suite position")
+	parser.add_argument("--gt-abort-drop", type=float, default=0.10,
+	                    help="Stop the run and restore the best checkpoint "
+	                         "once the ground-truth score falls this fraction "
+	                         "below the best seen (0.10 = a 10%% relative "
+	                         "drop).  0 disables.  Every diagnostic in run5 "
+	                         "fired correctly — held-out value MSE was flagged "
+	                         "worse than guessing from iteration 1 and the "
+	                         "suite read 38%% against a 91%% start — and none "
+	                         "of them did anything but print, so the run kept "
+	                         "training on its own collapse.  Enabling this "
+	                         "measures the suite once before the first "
+	                         "iteration to establish the baseline.")
 	parser.add_argument("--no-amp", dest="amp", action="store_false",
 	                    help="Disable bf16 autocast in the training step "
 	                         "(kept as an escape hatch; bf16 needs no loss "
@@ -545,6 +749,12 @@ def main():
 	                         "Use this after architecture changes so old "
 	                         "incompatible checkpoints don't block resume.")
 	args = parser.parse_args()
+
+	if args.lr is None:
+		# Resolved here rather than as an argparse default so that "not given"
+		# stays distinguishable: an SGD rate handed to AdamW is not a slightly
+		# aggressive setting, it diverges.
+		args.lr = 1e-4 if args.optimizer == "adamw" else 0.02
 
 	# Always make sure the checkpoint directory exists.
 	os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -559,21 +769,47 @@ def main():
 	print(f"Self-play procs : {args.workers}")
 	print(f"Checkpoint dir  : {args.checkpoint_dir}")
 	print(f"Checkpoint every: {args.checkpoint_every} iteration(s)")
+	print(f"Optimizer       : {args.optimizer}  lr={args.lr:g}"
+	      + (f"  warmup={args.warmup_iters} iter(s)"
+	         if args.warmup_iters > 0 else "  (no warmup)"))
+	print("Adjudication    : "
+	      + (f"{args.adjudicate_material:g} pawns for "
+	         f"{args.adjudicate_plies} plies"
+	         if args.adjudicate_material > 0 and args.adjudicate_plies > 0
+	         else "off"))
+
+	def _lr_scale(it):
+		"""LR multiplier at 0-based iteration index *it*.
+
+		Warmup times the milestone decay.  Expressing the whole schedule as a
+		pure function of the iteration number is what makes it resume-safe:
+		MultiStepLR decays incrementally, so its live rate depended on
+		restored optimiser state and quietly disagreed with the milestone list
+		whenever that list changed between runs.
+		"""
+		warm = 1.0
+		if args.warmup_iters > 0:
+			warm = min(1.0, (it + 1) / args.warmup_iters)
+		decay = args.lr_gamma ** sum(1 for m in args.lr_milestones
+		                             if it + 1 >= m)
+		return warm * decay
 
 	def _build_optim_and_sched(model, last_iter):
-		opt = torch.optim.SGD(
-			weight_decay_groups(model, args.weight_decay),
-			lr=args.lr,
-			momentum=args.momentum,
-			nesterov=True,
-		)
-		if last_iter > 0:
-			for pg in opt.param_groups:
-				pg.setdefault("initial_lr", pg["lr"])
-		sched = torch.optim.lr_scheduler.MultiStepLR(
+		groups = weight_decay_groups(model, args.weight_decay)
+		if args.optimizer == "adamw":
+			opt = torch.optim.AdamW(groups, lr=args.lr)
+		else:
+			opt = torch.optim.SGD(
+				groups,
+				lr=args.lr,
+				momentum=args.momentum,
+				nesterov=args.momentum > 0,
+			)
+		for pg in opt.param_groups:
+			pg.setdefault("initial_lr", pg["lr"])
+		sched = torch.optim.lr_scheduler.LambdaLR(
 			opt,
-			milestones=args.lr_milestones,
-			gamma=args.lr_gamma,
+			lr_lambda=_lr_scale,
 			last_epoch=last_iter - 1 if last_iter > 0 else -1,
 		)
 		return opt, sched
@@ -611,13 +847,26 @@ def main():
 				f"Re-run with --from-scratch, or move the old checkpoints aside.\n\n"
 				f"Underlying error:\n  {e}"
 			)
-		# Optimizer/scheduler state are only reloaded when the optimizer class
-		# itself matches — otherwise we silently start with fresh momentum.
-		try:
-			optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-		except (ValueError, KeyError):
-			print("Optimizer state incompatible with --optimizer choice — "
-			      "starting with a fresh optimizer.")
+		# Optimizer state is only reloaded when the optimiser that wrote it is
+		# the one being built now.  Checkpoints from src/pretrain.py carry no
+		# optimiser state at all, so this branch is also the pre-training
+		# hand-off: there is nothing to restore and the first iteration starts
+		# at full step size unless --warmup-iters says otherwise.
+		saved_optimizer = ckpt.get("optimizer", "")
+		if "optimizer_state_dict" not in ckpt:
+			print(f"Checkpoint carries no optimizer state (pre-trained net?) "
+			      f"— starting {args.optimizer} fresh."
+			      + ("" if args.warmup_iters > 0 else
+			         "  Consider --warmup-iters."))
+		elif saved_optimizer and saved_optimizer != args.optimizer:
+			print(f"Checkpoint optimizer ({saved_optimizer}) differs from "
+			      f"--optimizer {args.optimizer} — starting fresh.")
+		else:
+			try:
+				optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+			except (ValueError, KeyError, TypeError) as exc:
+				print(f"Optimizer state could not be restored ({exc}) — "
+				      f"starting {args.optimizer} fresh.")
 		sched_state = ckpt.get("scheduler_state_dict")
 		if sched_state is not None:
 			try:
@@ -686,6 +935,8 @@ def main():
 		"resign_threshold": args.resign_threshold,
 		"resign_plies": args.resign_plies,
 		"resign_disable_frac": args.resign_disable_frac,
+		"adjudicate_material": args.adjudicate_material,
+		"adjudicate_plies": args.adjudicate_plies,
 		"fpu_reduction": args.fpu_reduction,
 		"dirichlet_alpha": args.dirichlet_alpha,
 		"dirichlet_eps": args.dirichlet_eps,
@@ -696,10 +947,68 @@ def main():
 	}
 	weights_path = os.path.join(args.checkpoint_dir, ".selfplay_weights.pt")
 	ref_weights_path = os.path.join(args.checkpoint_dir, ".arena_ref.pt")
+	best_gt_path = os.path.join(args.checkpoint_dir, "best_gt.pt")
+
+	# ---- supervised anchor ----
+	anchor_ds = None
+	if args.anchor_data_dir and args.anchor_frac > 0.0:
+		t0 = time.time()
+		anchor_ds, n_shards = load_anchor_dataset(
+			args.anchor_data_dir, args.anchor_max_rows, args.seed)
+		print(f"Anchor          : {len(anchor_ds):,} rows from {n_shards} "
+		      f"shard(s), {args.anchor_frac:.0%} of each step "
+		      f"(indexed in {time.time() - t0:.1f}s)")
+	elif args.anchor_frac > 0.0:
+		print("Anchor          : off (no --anchor-data-dir).  Every training "
+		      "target is now a function of the net's own output.")
+
+	# ---- arena reference ----
+	# Established before the first iteration, not on the arena's first firing.
+	# Initialising it there cost a full --eval-every of extra delay before any
+	# comparison could happen (25 iterations became 50), which is long past
+	# the point where a collapse has already consumed the run.
+	if args.eval_every > 0 and args.eval_games > 0:
+		# The arena fires on iter_num % eval_every, so the first comparison is
+		# the next multiple of eval_every past start_iter, not start_iter plus
+		# eval_every.
+		next_arena = (start_iter // args.eval_every + 1) * args.eval_every
+		if ref_matches_arch(ref_weights_path, args.res_blocks, args.filters):
+			print(f"Arena reference : {ref_weights_path} (generation "
+			      f"{generation}), first comparison at iteration "
+			      f"{next_arena}")
+		else:
+			stale = os.path.exists(ref_weights_path)
+			_atomic_save(fp16_state_dict(model), ref_weights_path)
+			print("Arena reference : "
+			      + ("replaced — the existing file does not match "
+			         f"{args.res_blocks}x{args.filters} "
+			         if stale else "initialised ")
+			      + f"from iteration {start_iter} (generation {generation}), "
+			      f"first comparison at iteration {next_arena}")
+
+	# ---- ground-truth baseline ----
+	# The abort rule needs a score from *before* any self-play update, so the
+	# thing it protects (the pre-trained net) is what it compares against.
+	best_gt = None
+	if args.gt_every > 0 and args.gt_abort_drop > 0.0:
+		t0 = time.time()
+		passed, total, _breakdown = score_model(model, device, args.gt_sims)
+		best_gt = passed / total
+		print(f"Ground truth    : {passed}/{total} ({best_gt * 100:.0f}%) at "
+		      f"iteration {start_iter} — abort below "
+		      f"{best_gt * (1 - args.gt_abort_drop) * 100:.0f}%  "
+		      f"in {time.time() - t0:.0f}s")
+		_atomic_save(
+			checkpoint_payload(model, optimizer, scheduler, start_iter,
+			                   args.res_blocks, args.filters,
+			                   generation=generation,
+			                   optimizer_name=args.optimizer),
+			best_gt_path)
 
 	# ---- training loop ----
 	end_iter = start_iter + args.iterations
 	iteration = start_iter
+	aborted = False
 
 	with SelfPlayPool(args.workers, pool_cfg, weights_path,
 	                  ref_weights_path) as pool:
@@ -720,6 +1029,7 @@ def main():
 			done = 0
 			moves_total = 0
 			resigned = 0
+			adjudicated = 0
 			truncated = 0
 			t0 = time.time()
 			width = len(str(args.games_per_iter))
@@ -729,8 +1039,10 @@ def main():
 				iter_examples.extend(examples)
 				done += 1
 				moves_total += moves
-				if result.endswith("R"):
+				if result.endswith(" R"):
 					resigned += 1
+				elif result.endswith(" A"):
+					adjudicated += 1
 				elif result == "*":
 					truncated += 1
 				print(f"  Game {done:>{width}}/{args.games_per_iter}  "
@@ -751,6 +1063,8 @@ def main():
 				# is still the bottleneck.
 				print(f"  Game endings  : resigned {resigned}/{done} "
 				      f"({resigned / done * 100:.0f}%)  "
+				      f"adjudicated {adjudicated}/{done} "
+				      f"({adjudicated / done * 100:.0f}%)  "
 				      f"hit move limit {truncated}/{done} "
 				      f"({truncated / done * 100:.0f}%)")
 
@@ -787,6 +1101,15 @@ def main():
 				budget = f"{steps} steps (~{args.sample_reuse:g}x reuse)"
 			else:
 				budget = f"{args.epochs} full epochs"
+			n_anchor = 0
+			if anchor_ds is not None and steps:
+				n_anchor = int(round(steps * args.batch_size * args.anchor_frac))
+			anchor_examples = []
+			if n_anchor:
+				t0 = time.time()
+				anchor_examples = sample_anchor(anchor_ds, n_anchor)
+				budget += (f", {n_anchor} anchor rows "
+				           f"({time.time() - t0:.1f}s)")
 			print(f"Training: {budget}, batch {args.batch_size}, "
 			      f"lr={optimizer.param_groups[0]['lr']:.5f} …")
 			t0 = time.time()
@@ -794,6 +1117,7 @@ def main():
 				model, optimizer, device, replay_buffer,
 				batch_size=args.batch_size, steps=steps, epochs=args.epochs,
 				value_weight=args.value_weight, amp=args.amp,
+				extra_examples=anchor_examples,
 			)
 			elapsed = time.time() - t0
 			if losses:
@@ -821,9 +1145,28 @@ def main():
 				        and heldout["value_loss"] > heldout["value_baseline"] else "")
 				print(f"  Held-out    : policy CE {heldout['policy_loss']:.4f}  "
 				      f"value MSE {heldout['value_loss']:.4f}{flag}")
-				print(f"                (train {losses['policy_loss']:.4f} / "
-				      f"{losses['value_loss']:.4f}; predict-a-draw baseline "
+				# train_on_data returns None when the buffer is still smaller
+				# than one batch, which is the normal state of the first
+				# iteration or two of a fresh run.
+				trained = (f"train {losses['policy_loss']:.4f} / "
+				           f"{losses['value_loss']:.4f}; " if losses
+				           else "no training step yet; ")
+				print(f"                ({trained}predict-a-draw baseline "
 				      f"{heldout['value_baseline']:.4f})")
+				# The number that makes a collapsing value head visible while
+				# every loss is still falling.  Measured on this iteration's
+				# own positions, before the update that follows.
+				print(f"  Value scale : mean|V| "
+				      f"{heldout['pred_abs_mean']:.4f}  max|V| "
+				      f"{heldout['pred_abs_max']:.4f}")
+				if (args.resign_threshold < 0.0
+						and heldout["pred_abs_max"] < abs(args.resign_threshold)):
+					print(f"                WARNING: max|V| is below "
+					      f"|--resign-threshold| ({abs(args.resign_threshold):.2f}), "
+					      f"so resignation can no longer fire at all"
+					      + ("; adjudication is carrying the decisive labels."
+					         if args.adjudicate_material > 0 else
+					         " and nothing else supplies decisive labels."))
 
 			# Step the LR scheduler once per iteration regardless of whether a
 			# training update happened — this keeps the schedule aligned with the
@@ -840,11 +1183,12 @@ def main():
 			# monotone generation counter.
 			if (args.eval_every > 0 and args.eval_games > 0
 					and iter_num % args.eval_every == 0):
-				if not os.path.exists(ref_weights_path):
+				if not ref_matches_arch(ref_weights_path, args.res_blocks,
+				                        args.filters):
 					_atomic_save(fp16_state_dict(model), ref_weights_path)
-					print(f"Arena reference initialised from iteration "
+					print(f"Arena reference re-initialised from iteration "
 					      f"{iter_num} (generation {generation}) — "
-					      f"first comparison at iteration "
+					      f"next comparison at iteration "
 					      f"{iter_num + args.eval_every}.")
 				else:
 					# Workers still hold the pre-training weights from this
@@ -899,9 +1243,38 @@ def main():
 				passed, total, breakdown = score_model(model, device, args.gt_sims)
 				parts = "  ".join(f"{c} {p}/{t}"
 				                  for c, (p, t) in breakdown.items())
+				score = passed / total
 				print(f"Ground truth: {passed}/{total} "
-				      f"({100 * passed / total:.0f}%)   {parts}   "
+				      f"({100 * score:.0f}%)   {parts}   "
 				      f"in {time.time() - t0:.0f}s")
+				if args.gt_abort_drop > 0.0:
+					if best_gt is None or score > best_gt:
+						best_gt = score
+						_atomic_save(
+							checkpoint_payload(
+								model, optimizer, scheduler, iter_num,
+								args.res_blocks, args.filters,
+								generation=generation,
+								optimizer_name=args.optimizer),
+							best_gt_path)
+						print(f"  New best — kept at {best_gt_path}")
+					elif score < best_gt * (1.0 - args.gt_abort_drop):
+						# Stop before the checkpoint write below, so latest.pt
+						# is not carrying the collapsed weights when the
+						# rollback lands on it.
+						print(f"  ABORT: {100 * score:.0f}% is "
+						      f"{100 * (1 - score / best_gt):.0f}% below the "
+						      f"run best {100 * best_gt:.0f}% — the loop is "
+						      f"training on its own degradation.")
+						if os.path.exists(best_gt_path):
+							best = torch.load(best_gt_path, map_location="cpu",
+							                  weights_only=False)
+							_atomic_save(best, latest_path)
+							print(f"  Restored the best checkpoint (iteration "
+							      f"{best.get('iteration', '?')}) to "
+							      f"{latest_path}.")
+						aborted = True
+						break
 
 			# -- checkpoint --
 			# Always refresh latest.pt; keep a numbered snapshot only every
@@ -914,7 +1287,7 @@ def main():
 			save_checkpoint(
 				model, optimizer, scheduler, iter_num, args.checkpoint_dir,
 				args.res_blocks, args.filters, numbered=keep_numbered,
-				generation=generation,
+				generation=generation, optimizer_name=args.optimizer,
 			)
 			if keep_numbered:
 				print(f"Checkpoint saved  (iteration {iter_num}, snapshot kept)")
@@ -926,9 +1299,16 @@ def main():
 		save_checkpoint(
 			model, optimizer, scheduler, iteration + 1, args.checkpoint_dir,
 			args.res_blocks, args.filters, numbered=True,
-			generation=generation,
+			generation=generation, optimizer_name=args.optimizer,
 		)
 		print(f"Emergency checkpoint saved  (iteration {iteration + 1})")
+
+	if aborted:
+		raise SystemExit(
+			"\nAborted on a ground-truth regression.  latest.pt holds the "
+			"best checkpoint of the run; diagnose before resuming, because a "
+			"plain resume will walk straight back into it."
+		)
 
 	print("\nTraining finished.")
 

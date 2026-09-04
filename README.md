@@ -172,8 +172,14 @@ python tools/label_sf.py --in-dir data/bootstrap/positions \
 # 5. Pre-train, then hand the weights to the self-play loop
 python -m src.pretrain --data-dir data/bootstrap/labels --epochs 3
 cp checkpoints/pretrained.pt checkpoints/latest.pt
-./train.sh --search-value-weight 0.35 --buffer-size 1000000
+./train.sh --optimizer adamw --warmup-iters 10 --value-weight 1.0 \
+           --anchor-data-dir data/bootstrap/labels --anchor-frac 0.25 \
+           --eval-every 5 --gt-every 5 --gt-abort-drop 0.10 \
+           --buffer-size 400000
 ```
+
+Every flag on that `train.sh` line is there because run5 collapsed without it;
+see [Handing a pre-trained net to self-play](#handing-a-pre-trained-net-to-self-play).
 
 `latest.pt` is the only checkpoint `play.sh` and `src/engine.py` look for, and
 nothing writes it except `src/train.py` and that `cp`.  `next_round.sh` writes
@@ -214,14 +220,81 @@ own noise:
 
 - `--search-value-weight` (default 0.35) takes that fraction of each value
   target from the position's own MCTS root Q rather than the game outcome.
-  Root Q varies ply to ply, so two drawn games stop sharing one label.
-- Games cut off at `--max-moves` now take the search value outright.  They are
+  Root Q varies ply to ply, so two *decided* games stop sharing one label per
+  side.  It is applied to decided games only — see below for why applying it
+  to draws was actively harmful.
+- Games cut off at `--max-moves` take the search value outright.  They are
   unfinished, not drawn, and labelling several hundred of their positions 0.0
   was the largest remaining source of value-label noise.
+- `--adjudicate-material` (default 5 pawns held for `--adjudicate-plies` 20)
+  awards a decided game without consulting the network.
 
-`--buffer-size` also defaults to 1M rather than 200k.  Of every axis in the
-table above, the replay window is the only one that costs RAM instead of GPU
-time.
+`--buffer-size` defaults to 1M rather than 200k.  Of every axis in the table
+above, the replay window is the only one that costs RAM instead of GPU time —
+but note that a position is stored with a *dense* 4672-slot policy target, so
+it costs ~24 KB, and a full 1M-position buffer is ~24 GB of resident memory.
+Size it against the RAM you actually have.
+
+### Handing a pre-trained net to self-play
+
+Pre-training works — the 70M-position round scores 91% on the ground-truth
+suite and 22-0-8 against the classical baseline.  Feeding that net to the
+self-play loop at defaults destroys it: run5 went from 91% to 38% on the suite
+in five iterations while every loss it printed fell monotonically, because the
+degenerate fixed point it was converging on *is* the loss minimum.  The
+mechanism, in order:
+
+1. **The pre-training LR is not the self-play LR.**  `src/pretrain.py` ends a
+   OneCycle schedule at 1e-5 under AdamW.  `--lr` then defaulted to 0.02 under
+   fresh-momentum SGD — 2000x the step size the weights had converged at, and
+   the first iteration spends it on a replay buffer holding one iteration of
+   self-play.  Use `--optimizer adamw` and `--warmup-iters`.
+2. **Resignation is measured against an absolute threshold.**
+   `--resign-threshold -0.9` needs the value head to still output large
+   magnitudes.  One iteration in, run5's max|V| was 0.36, so resignation went
+   from 74% of games to 1% and never fired again — and resignation was the
+   only thing keeping decided games from grinding to the 50-move rule and
+   labelling all of their positions a draw.  `--adjudicate-material` supplies
+   decisive labels from material alone, so it keeps working through exactly
+   the collapse that silences resignation.
+3. **Blending root Q into a *draw* label contracts the value head.**  For a
+   target `(1-w)*z + w*V` the MSE fixed point is `V = z` for any `w`, so on a
+   draw (`z = 0`) blending does not escape the constant-0 fixed point — it
+   just pulls V toward 0 by a factor of `w` per iteration, out of the net's
+   own output and nothing external.  With 90% of games drawn that is a
+   geometric contraction: run5's mean|V| fell 0.669 -> 0.043, ~0.58x per
+   iteration.  Finished draws now take a plain 0.0.
+4. **Nothing in the loop is anchored outside it.**  The policy target is the
+   net's own search, the value target is the game its own moves produced.
+   `--anchor-data-dir` mixes the Stockfish-labelled shards back into every
+   training step; they are the only fixed quantity in the project.  It also
+   stops the policy head being flattened: the MCTS visit targets carry ~2.07
+   nats against pre-training's ~1.24, so training on them alone is a
+   downgrade, and run5's own prior went from 1.52 to 2.48 nats.
+5. **Every diagnostic printed and none of them acted.**  The suite read 38%
+   at iteration 5 and the run kept training.  `--gt-abort-drop` now stops it
+   and restores the best checkpoint.  `--eval-every` establishes the arena reference before the
+   first iteration instead of on the arena's first firing (which cost a whole
+   extra `--eval-every` before any comparison), and the reference file is
+   checked against the current architecture — run5 carried run4's 8x128
+   reference into a 16x192 run, so the arena would have killed every worker
+   the first time it fired.
+
+Each iteration now reports `Value scale : mean|V| … max|V| …`.  That is the
+number to watch: it is the one quantity that exposes a collapsing value head
+while the loss curve still looks healthy, and it warns outright once max|V|
+drops below `|--resign-threshold|`.
+
+**Do not read `<-- WORSE THAN GUESSING` as a collapse signal.**  It compares
+held-out value MSE against the variance of the outcome labels, and a
+*correctly* pre-trained head fails that comparison: it is calibrated to
+Stockfish's WDL and stays confident, while a single game's outcome is noisy,
+so its squared error exceeds the labels' own variance.  It fired on every
+iteration of run5 — and it fires on a healthy run from the same checkpoint too
+(value MSE 0.47 against a 0.35 baseline at iteration 2, with mean|V| holding
+at 0.57 and resignation at 70%).  A flag that is on in both cases distinguishes
+nothing, and treating it as an alarm is what trains you to ignore the log.
+Trend mean|V|, the resignation rate, and the suite instead.
 
 
 ### Running unattended

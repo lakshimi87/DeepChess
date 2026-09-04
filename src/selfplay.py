@@ -48,10 +48,32 @@ from .model import ChessNet
 # One game
 # ---------------------------------------------------------------------------
 
+# Material values in pawns, for adjudication only.  Deliberately crude: the
+# point of this scale is that it does not come from the network, so it cannot
+# drift when the value head does.
+_ADJ_VALUES = (
+	(chess.QUEEN, 9.0),
+	(chess.ROOK, 5.0),
+	(chess.BISHOP, 3.0),
+	(chess.KNIGHT, 3.0),
+	(chess.PAWN, 1.0),
+)
+
+
+def material_balance(board):
+	"""Material in pawns, positive when White is ahead."""
+	total = 0.0
+	for piece_type, value in _ADJ_VALUES:
+		total += value * (len(board.pieces(piece_type, chess.WHITE))
+		                  - len(board.pieces(piece_type, chess.BLACK)))
+	return total
+
+
 def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
               temp_high=1.0, temp_low=0.1, resign_threshold=0.0,
               resign_plies=2, resign_disable_frac=0.1,
-              search_value_weight=0.0):
+              search_value_weight=0.0, adjudicate_material=0.0,
+              adjudicate_plies=0):
 	"""Play one self-play game with *mcts* and return (examples, result).
 
 	*mcts* is reused across games — :meth:`MCTS.search` builds a fresh root
@@ -73,32 +95,59 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	resigned at -0.9 that was in fact holdable — so the fraction is what keeps
 	the threshold auditable rather than self-confirming.
 
+	**Adjudication.**  A side also wins once it has held a material lead of
+	*adjudicate_material* pawns for *adjudicate_plies* consecutive plies.
+	Unlike resignation this test never touches the network, which is the whole
+	reason it exists: resignation is measured against an absolute root-Q
+	threshold, so the moment the value head's output scale shrinks the
+	threshold becomes unreachable and the *only* supply of decisive labels
+	stops — run5 went from 74% resignations to 1% in one iteration and never
+	recovered, because max|V| had fallen to 0.36 against a -0.9 threshold.  A
+	material margin is measured in pawns and cannot drift with the net, so it
+	keeps producing decisive labels through exactly the collapse that silences
+	resignation.
+
 	**Value targets.**  A pure game-outcome label is the same number for every
-	position in a game, so in a corpus that is ~57% draws the constant 0.0 is
-	genuinely the loss-minimising prediction and the value head converges to
-	it.  *search_value_weight* blends in each position's own root Q, which
-	differs from ply to ply, so two drawn games stop sharing one label and the
-	constant stops being optimal.
+	position in a game, so in a draw-heavy corpus the constant 0.0 minimises
+	the loss and the value head converges to it.  *search_value_weight* blends
+	in each position's own root Q so that two decisive games stop sharing one
+	label per side.
 
-	The blend is self-referential — root Q comes from the value head being
-	trained — so it only helps once that head already carries signal.  Run it
-	at 0.0 from a random initialisation and it reinforces the net's own noise;
-	the intended use is after supervised pre-training (see src/pretrain.py).
+	The blend is applied to *decided* games only, and that restriction is load
+	bearing.  MSE training drives V toward its target, so for a target
+	``(1-w)*z + w*V`` the fixed point is V = z whatever w is: blending does not
+	move the fixed point, it only decides how fast V gets there.  On a drawn
+	game z is 0, so blending buys nothing — it just makes the target *look*
+	varied while pulling V toward 0 by a factor of w per iteration out of the
+	net's own output, with no external quantity anywhere in the loop.  That is
+	the contraction that emptied run5's value head (mean|V| 0.669 -> 0.043 over
+	five iterations, ~0.58x each).  A finished draw now takes a plain 0.0,
+	which is simply the correct label for it; keeping the draw rate low enough
+	that 0.0 is not the whole corpus is adjudication's job, not the blend's.
 
-	Games cut off at *max_moves* are the one case that takes the search value
-	outright.  Those are not draws — they are unfinished — and labelling
-	several hundred of their positions 0.0 is the single largest source of
-	value-label noise left once resignation is on.
+	Games cut off at *max_moves* still take the search value outright.  Those
+	are not draws — they are unfinished — so 0.0 would be a wrong label rather
+	than a degenerate one.  Adjudication should keep them rare; watch the
+	reported rate and treat a rising one as the signal to tighten
+	*adjudicate_material*.
 	"""
 	board = chess.Board()
 	history = []  # (encoded_state, policy, turn, root_q)
 
-	resign_enabled = (resign_threshold < 0.0
-	                  and np.random.random() >= resign_disable_frac)
+	# One roll decides whether this game plays to a natural finish.  Both
+	# early-stop mechanisms share it, so the same audit fraction that catches a
+	# false resignation also catches a material lead that was in fact holdable.
+	audit_game = np.random.random() < resign_disable_frac
+	resign_enabled = resign_threshold < 0.0 and not audit_game
+	adjudicate_enabled = (adjudicate_material > 0.0 and adjudicate_plies > 0
+	                      and not audit_game)
 	# Counted per colour: the root Q alternates POV every ply, so a single
 	# counter would trip on two *different* sides each thinking they are lost.
 	bad_turns = {chess.WHITE: 0, chess.BLACK: 0}
 	resigned_by = None
+	adjudicated_win = None
+	adj_leader = None
+	adj_plies = 0
 
 	move_count = 0
 	while not board.is_game_over() and move_count < max_moves:
@@ -126,8 +175,24 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 			else:
 				bad_turns[mover] = 0
 
+		if adjudicate_enabled:
+			balance = material_balance(board)
+			leader = None
+			if abs(balance) >= adjudicate_material:
+				leader = chess.WHITE if balance > 0 else chess.BLACK
+			if leader is None:
+				adj_leader, adj_plies = None, 0
+			else:
+				adj_plies = adj_plies + 1 if leader == adj_leader else 1
+				adj_leader = leader
+				if adj_plies >= adjudicate_plies:
+					adjudicated_win = leader
+					break
+
 	if resigned_by is not None:
 		winner = not resigned_by
+	elif adjudicated_win is not None:
+		winner = adjudicated_win
 	elif board.is_checkmate():
 		winner = not board.turn  # side to move is mated
 	else:
@@ -136,8 +201,8 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	# A game that ran out of moves is unfinished, not drawn.  Its outcome
 	# label carries no information at all, so the search value replaces it
 	# rather than being blended with it.
-	truncated = (resigned_by is None and not board.is_game_over()
-	             and move_count >= max_moves)
+	truncated = (resigned_by is None and adjudicated_win is None
+	             and not board.is_game_over() and move_count >= max_moves)
 
 	examples = []
 	total = len(history)
@@ -151,8 +216,13 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 		if value_discount < 1.0:
 			value *= value_discount ** (total - i)
 		if truncated:
+			# Unfinished, not drawn: 0.0 would be an actively wrong label, and
+			# there is no outcome to anchor to, so the search value stands in.
 			value = root_q
-		elif search_value_weight > 0.0:
+		elif winner is not None and search_value_weight > 0.0:
+			# Decided games only.  On a draw the fixed point of this blend is
+			# 0 anyway, so blending there would contract the value head toward
+			# zero out of its own output and nothing else — see the docstring.
 			value = ((1.0 - search_value_weight) * value
 			         + search_value_weight * root_q)
 		examples.append((state, policy, value))
@@ -161,6 +231,11 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 		# board.result() is "*" here — the game is decided but not over.
 		# The trailing R keeps the resignation rate greppable in the log.
 		result = "1-0 R" if winner == chess.WHITE else "0-1 R"
+	elif adjudicated_win is not None:
+		# Likewise for A: the two mechanisms are counted separately because a
+		# run where only adjudication fires has a dead value head even though
+		# its decisive-label rate looks healthy.
+		result = "1-0 A" if winner == chess.WHITE else "0-1 A"
 	else:
 		result = board.result()
 	return examples, result
@@ -326,6 +401,8 @@ def _worker(rank, task_q, result_q, cfg):
 					resign_plies=cfg.get("resign_plies", 2),
 					resign_disable_frac=cfg.get("resign_disable_frac", 0.1),
 					search_value_weight=cfg.get("search_value_weight", 0.0),
+					adjudicate_material=cfg.get("adjudicate_material", 0.0),
+					adjudicate_plies=cfg.get("adjudicate_plies", 0),
 				)
 				result_q.put(("game", game_id, examples, result,
 				              len(examples), time.perf_counter() - t0))

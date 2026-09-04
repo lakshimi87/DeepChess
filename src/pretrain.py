@@ -336,11 +336,18 @@ def main():
 		      f"(baseline {val['baseline']:.4f}, n={val['n']:,})  "
 		      f"in {(time.time()-t_ep)/60:.1f}m", flush=True)
 
-		# No optimizer/scheduler state: this run uses AdamW+OneCycle while the
-		# self-play loop uses SGD+MultiStepLR, so there is nothing meaningful
-		# to hand over.  train.py catches the resulting KeyError and starts
-		# with a fresh optimizer -- passing an explicit None would raise a
-		# TypeError it does not catch.
+		# No optimizer state is stored: AdamW's moments are 2x the parameters,
+		# which would put another ~92 MB in a file that gets copied around by
+		# hand.  train.py notices the absence and says so rather than
+		# inferring anything from it.
+		#
+		# The cost is that the self-play loop cannot continue this schedule,
+		# and it must not paper over that: OneCycle ends at --min-lr (1e-5),
+		# so handing these weights to a fresh optimiser at a self-play default
+		# of 0.02 is a 2000x step-size discontinuity, and run5 lost a 91% net
+		# to it in one iteration.  Hand over with
+		# `--optimizer adamw --warmup-iters N` instead, which ramps back up
+		# from 1/N of the target rate.
 		payload = {
 			"model_state_dict": model.state_dict(),
 			"scheduler_state_dict": None,
