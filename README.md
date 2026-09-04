@@ -173,7 +173,7 @@ python tools/label_sf.py --in-dir data/bootstrap/positions \
 python -m src.pretrain --data-dir data/bootstrap/labels --epochs 3
 cp checkpoints/pretrained.pt checkpoints/latest.pt
 ./train.sh --optimizer adamw --warmup-iters 10 --value-weight 1.0 \
-           --anchor-data-dir data/bootstrap/labels --anchor-frac 0.25 \
+           --anchor-data-dir data/bootstrap/labels --anchor-frac 0.5 \
            --eval-every 5 --gt-every 5 --gt-abort-drop 0.10 \
            --buffer-size 400000
 ```
@@ -270,7 +270,8 @@ mechanism, in order:
    training step; they are the only fixed quantity in the project.  It also
    stops the policy head being flattened: the MCTS visit targets carry ~2.07
    nats against pre-training's ~1.24, so training on them alone is a
-   downgrade, and run5's own prior went from 1.52 to 2.48 nats.
+   downgrade, and run5's own prior went from 1.52 to 2.48 nats.  The
+   *fraction* is load-bearing and 0.25 is not enough — see below.
 5. **Every diagnostic printed and none of them acted.**  The suite read 38%
    at iteration 5 and the run kept training.  `--gt-abort-drop` now stops it
    and restores the best checkpoint.  `--eval-every` establishes the arena reference before the
@@ -296,6 +297,66 @@ at 0.57 and resignation at 70%).  A flag that is on in both cases distinguishes
 nothing, and treating it as an alarm is what trains you to ignore the log.
 Trend mean|V|, the resignation rate, and the suite instead.
 
+
+### What `--anchor-frac` is worth
+
+Points 1-5 keep the net from collapsing.  They do not, on their own, keep it
+from *leaking*, and the difference took three runs to separate.  All three
+started from the same 70M pre-trained net (759/837) and differed in one flag:
+
+| run | change | @0 | @5 | @10 | @15 | @20 | slope (pts/iter) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| run5 | none of the above | 758 | 319 | — | — | — | collapse |
+| run6 | all of the above, `--anchor-frac 0.25` | 759 | 750 | 735 | — | — | **-2.40 +/- 0.35** |
+| run7 | run6 + `--adjudicate-material 10 --adjudicate-plies 40` | 759 | 737 | — | — | — | — |
+| run8 | run6 + `--anchor-frac 0.5` | 759 | 764 | 758 | 744 | 755 | **-0.56 +/- 0.44** |
+
+**Read the slope, never two readings.**  Re-scoring one fixed checkpoint three
+times gave 758/759/759 -- SD 0.6, which is the suite's measuring noise.  But
+consecutive readings *within* run8 scatter with SD 7.4, because the net really
+does wander between iterations.  Judging an iteration-to-iteration difference
+against the 0.6 floor makes every wiggle look like a 5-sigma event: during run8
+this produced three confident and contradictory calls in a row -- "settled" at
+iteration 3, "leak stopped" at 10, "leak confirmed" at 15 -- from data that
+supported none of them.  Four or more readings and a slope with its standard
+error, or say nothing.
+
+run6 does not collapse and still loses 2.40 +/- 0.35 points an iteration,
+which `--gt-abort-drop` never sees: a 10% relative drop from 759 is ~30
+iterations off at that rate.  A guard tuned to run5's cliff does not see a
+leak, and tightening it enough to catch one would fire on the SD-7.4 scatter
+above instead.  That gap is documented, not closed.
+
+The leak is the anchor fraction.  At 0.5 the slope is -0.56 +/- 0.44 points an
+iteration over 20 iterations -- not separable from flat (t = 1.3) -- against
+run6's -2.40 +/- 0.35 at 0.25 (t = 6.9).  Both runs sit in a 744-764 band the
+whole way; what differs is whether the band drifts.  0.5 also holds the value head's output scale up — mean|V| at
+iteration 5 was 0.44 against run6's 0.41, and max|V| stayed above
+`|--resign-threshold|` so resignation kept firing at all instead of dying at
+iteration 4.  Anchor rows cost ~1.4s per iteration at 0.5, against ~180s of
+self-play, so the fraction is free in wall-clock terms and should be chosen on
+the score alone.
+
+run7 is here because it tests a wrong diagnosis worth recording.  The two
+categories that lose points are Opening and Endgame, and adjudication awarding
+a game at +5 pawns plainly truncates it before any endgame appears — so
+loosening adjudication to +10 pawns for 40 plies should have recovered them.
+It recovered nothing: Endgame read 69/91 and Opening 85/95 in *both* runs, bit
+for bit.  Resignation truncates games just as adjudication does, and it was
+ending 74%/64%/50% of run7's first three iterations, so swapping which
+mechanism fires never changed how early games end.  What the looser threshold
+did change was label quality: adjudication fell from 58% of games to 8%,
+draw labels hit 85%, and Middlegame, Tactics and Eval gave up 13 points
+between them.  The termination rule governs the draw rate and nothing else.
+
+What is left after the leak is closed is a structural deficit in the same two
+categories every time, Opening and Endgame, which doubling the anchor does not
+touch (Opening read 85, 83, 84, 85 across the runs and Endgame 69, 69, 72, 66).  Self-play plays 200 games an
+iteration from the same start position with root Dirichlet noise as the only
+divergence, so a handful of openings carry thousands of positions each while
+the anchor's opening rows are scattered thin across 8M samples of every phase.
+That is an opening-diversity problem in the self-play generator, not an anchor
+dose, and it is the next thing to fix.
 
 ### Running unattended
 
