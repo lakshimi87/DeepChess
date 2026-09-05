@@ -10,6 +10,7 @@ loads the latest checkpoint and continues from where it left off.
 """
 
 import argparse
+import collections
 import math
 import os
 import random
@@ -26,7 +27,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from . import _ext, perf
 from .model import ChessNet
 from .paths import CHECKPOINTS_DIR
-from .selfplay import SelfPlayPool, fp16_state_dict
+from .selfplay import (SelfPlayPool, calibrate_resign_threshold,
+                       false_positives_at, fp16_state_dict)
 from .validate_gt import score_model
 
 # Self-play is CPU-bound, so configure single-threaded torch *before* any
@@ -537,6 +539,43 @@ def main():
 	                         "resignation and adjudication and play on; the "
 	                         "only way to see a false positive, so keep it "
 	                         "above 0")
+	parser.add_argument("--resign-fp-target", type=float, default=0.20,
+	                    help="Target false-positive rate for resignation.  "
+	                         "Each iteration the threshold is re-derived from "
+	                         "the --resign-disable-frac audit games as the "
+	                         "loosest value whose false-positive rate — sides "
+	                         "that would have resigned and then were neither "
+	                         "mated nor materially crushed — stays at or under "
+	                         "this.  0 disables calibration and pins the "
+	                         "threshold at --resign-threshold, which is what "
+	                         "run8 did: root Q's scale halved under a fixed "
+	                         "-0.9 bound and resignation fired in 0 of 200 "
+	                         "games for 85 straight iterations.  "
+	                         "0.20 rather than AlphaZero's 0.05 because the "
+	                         "arbiter here is coarse: 120 audited sides of "
+	                         "pretrained_70M bottom out at 15%% false "
+	                         "positives at -0.99 and 36%% at -0.90, and the "
+	                         "iteration-100 net reaches 8%% at -0.50 but "
+	                         "cannot fire at all above -0.80.  Nothing "
+	                         "qualifies at 0.05 for either, so that target "
+	                         "leaves resignation switched off; 0.20 gives both "
+	                         "a working point.  Note the measure is "
+	                         "conservative in the direction that matters: a "
+	                         "side that was positionally lost but materially "
+	                         "level counts as a false positive, so true error "
+	                         "is below the number reported.")
+	parser.add_argument("--resign-calib-min", type=int, default=10,
+	                    help="Resignations a candidate threshold must produce "
+	                         "in the audit sample before it can be adopted.  "
+	                         "Below this the false-positive rate is an "
+	                         "estimate off a handful of games, so the "
+	                         "threshold is left where it is.")
+	parser.add_argument("--resign-calib-window", type=int, default=5,
+	                    help="Iterations of audit games kept in the "
+	                         "calibration sample.  One iteration yields only "
+	                         "~2*games_per_iter*resign_disable_frac samples, "
+	                         "too few to place a 5%% rate; too many and the "
+	                         "window outlives the value scale it is measuring.")
 	parser.add_argument("--adjudicate-material", type=float, default=5.0,
 	                    help="Award the game to a side that has held this "
 	                         "material lead, in pawns, for "
@@ -774,9 +813,17 @@ def main():
 	         if args.warmup_iters > 0 else "  (no warmup)"))
 	print("Adjudication    : "
 	      + (f"{args.adjudicate_material:g} pawns for "
-	         f"{args.adjudicate_plies} plies"
+	         f"{args.adjudicate_plies} plies (self-play and arena)"
 	         if args.adjudicate_material > 0 and args.adjudicate_plies > 0
 	         else "off"))
+	print("Resignation     : "
+	      + ("off" if args.resign_threshold >= 0.0 else
+	         f"root Q <= {args.resign_threshold:+.2f} for "
+	         f"{args.resign_plies} turns"
+	         + (f", recalibrated each iteration to "
+	            f"{args.resign_fp_target * 100:.0f}% false positives over "
+	            f"{args.resign_calib_window} iterations of audit games"
+	            if args.resign_fp_target > 0.0 else " (fixed)")))
 
 	def _lr_scale(it):
 		"""LR multiplier at 0-based iteration index *it*.
@@ -919,6 +966,16 @@ def main():
 
 	signal.signal(signal.SIGINT, _handle_sigint)
 
+	# The live resignation threshold, re-derived from audit games each
+	# iteration; args.resign_threshold is only its starting point.  The sample
+	# is a rolling window rather than one iteration's worth: 200 games at a 10%
+	# audit fraction yield ~40 samples, and a 5% false-positive rate estimated
+	# off 40 samples moves a whole percentage point per game.
+	resign_threshold = args.resign_threshold
+	resign_samples = collections.deque(
+		maxlen=max(1, args.resign_calib_window)
+		* max(1, int(args.games_per_iter * args.resign_disable_frac)) * 2)
+
 	# ---- self-play worker pool ----
 	# Workers hold their own fp16 inference copy of the net, so the fp32
 	# training weights here stay pristine.  The pool is persistent: CUDA
@@ -932,7 +989,7 @@ def main():
 		"max_moves": args.max_moves,
 		"value_discount": args.value_discount,
 		"search_value_weight": args.search_value_weight,
-		"resign_threshold": args.resign_threshold,
+		"resign_threshold": resign_threshold,
 		"resign_plies": args.resign_plies,
 		"resign_disable_frac": args.resign_disable_frac,
 		"adjudicate_material": args.adjudicate_material,
@@ -1033,12 +1090,15 @@ def main():
 			truncated = 0
 			t0 = time.time()
 			width = len(str(args.games_per_iter))
-			for examples, result, moves, secs in pool.play(
+			for examples, result, moves, secs, audit in pool.play(
 				args.games_per_iter, stop_early=lambda: interrupted,
+				resign_threshold=resign_threshold,
 			):
 				iter_examples.extend(examples)
 				done += 1
 				moves_total += moves
+				if audit:
+					resign_samples.extend(audit)
 				if result.endswith(" R"):
 					resigned += 1
 				elif result.endswith(" A"):
@@ -1067,6 +1127,51 @@ def main():
 				      f"({adjudicated / done * 100:.0f}%)  "
 				      f"hit move limit {truncated}/{done} "
 				      f"({truncated / done * 100:.0f}%)")
+
+			# -- resignation calibration --
+			# The threshold is an absolute bound on root Q, and root Q's scale
+			# rides on the value head's, so a fixed threshold is outlived by
+			# the net rather than obeyed by it.  The audit games are the only
+			# place a false positive is observable, so they are what sets it.
+			if (args.resign_threshold < 0.0 and args.resign_fp_target > 0.0
+					and resign_samples):
+				old_fp, old_fired = false_positives_at(
+					resign_samples, resign_threshold)
+				# The strict reading, printed beside the operative one so the
+				# gap between them is visible.  It is large whenever the net
+				# cannot convert: audit games run with adjudication off, so a
+				# won position that grinds to the 50-move rule scores as a draw
+				# and every correct resignation in it reads as an error.
+				res_fp, res_fired = false_positives_at(
+					resign_samples, resign_threshold, by_result=True)
+				picked = calibrate_resign_threshold(
+					resign_samples, resign_threshold,
+					fp_target=args.resign_fp_target,
+					min_resigns=args.resign_calib_min,
+				)
+				# "0/0" is the diagnosis run8 never printed: the threshold is
+				# not too loose or too strict, it is unreachable.
+				was = (f"{old_fp}/{old_fired} "
+				       f"({old_fp / old_fired * 100:.0f}%)" if old_fired
+				       else "0/0 (threshold unreachable)")
+				strict = (f"; by scoreline alone {res_fp}/{res_fired} "
+				          f"({res_fp / res_fired * 100:.0f}%)"
+				          if res_fired else "")
+				if picked is None:
+					print(f"  Resign calib  : threshold stays "
+					      f"{resign_threshold:+.2f}; no candidate gives "
+					      f"{args.resign_calib_min}+ resignations at or "
+					      f"under {args.resign_fp_target * 100:.0f}% false "
+					      f"positives over {len(resign_samples)} audit "
+					      f"samples (was {was}{strict})")
+				else:
+					new_t, new_fp, new_fired = picked
+					print(f"  Resign calib  : threshold {new_t:+.2f} "
+					      f"(was {resign_threshold:+.2f})   "
+					      f"false positives {was} -> {new_fp}/{new_fired} "
+					      f"({new_fp / new_fired * 100:.0f}%)   "
+					      f"over {len(resign_samples)} audit samples{strict}")
+					resign_threshold = new_t
 
 			pstats = policy_target_stats(iter_examples)
 			vstats = value_target_stats(iter_examples)
@@ -1159,14 +1264,35 @@ def main():
 				print(f"  Value scale : mean|V| "
 				      f"{heldout['pred_abs_mean']:.4f}  max|V| "
 				      f"{heldout['pred_abs_max']:.4f}")
-				if (args.resign_threshold < 0.0
-						and heldout["pred_abs_max"] < abs(args.resign_threshold)):
-					print(f"                WARNING: max|V| is below "
-					      f"|--resign-threshold| ({abs(args.resign_threshold):.2f}), "
-					      f"so resignation can no longer fire at all"
-					      + ("; adjudication is carrying the decisive labels."
-					         if args.adjudicate_material > 0 else
-					         " and nothing else supplies decisive labels."))
+				# This used to compare pred_abs_max against the threshold,
+				# which is the wrong pair of quantities: pred_abs_max is a max
+				# over raw value-head outputs across the batch, while
+				# resignation reads root Q — a visit-weighted *mean* over the
+				# root's edges, and so systematically less extreme.  Through
+				# all of run8 max|V| sat at 0.93-0.98 against a -0.9 threshold,
+				# the warning fired in 16 iterations out of 100, and none of
+				# them were the 85 consecutive iterations in which resignation
+				# actually fired zero times.  The audit sample measures the
+				# quantity the threshold is applied to, so it is what the guard
+				# now reads.
+				if args.resign_threshold < 0.0 and resign_samples:
+					triggers = sorted(row[0] for row in resign_samples)
+					reachable = sum(1 for t_q in triggers
+					                if t_q <= resign_threshold)
+					print(f"  Resign reach  : root Q trigger p10 "
+					      f"{triggers[len(triggers) // 10]:+.2f}  "
+					      f"median {triggers[len(triggers) // 2]:+.2f}  "
+					      f"({reachable}/{len(triggers)} audit sides reach "
+					      f"{resign_threshold:+.2f})")
+					if reachable == 0:
+						print(f"                WARNING: no audited side ever "
+						      f"reached {resign_threshold:+.2f}, so "
+						      f"resignation cannot fire"
+						      + ("; adjudication is carrying the decisive "
+						         "labels."
+						         if args.adjudicate_material > 0 else
+						         " and nothing else supplies decisive "
+						         "labels."))
 
 			# Step the LR scheduler once per iteration regardless of whether a
 			# training update happened — this keeps the schedule aligned with the
@@ -1201,7 +1327,8 @@ def main():
 					t0 = time.time()
 					scores = []
 					wins = draws = losses_n = 0
-					for score, _result, _mv, _sec in pool.match(args.eval_games):
+					arena_adjudicated = 0
+					for score, result, _mv, _sec in pool.match(args.eval_games):
 						scores.append(score)
 						if score > 0.75:
 							wins += 1
@@ -1209,6 +1336,8 @@ def main():
 							losses_n += 1
 						else:
 							draws += 1
+						if result.endswith(" A"):
+							arena_adjudicated += 1
 					win_rate = sum(scores) / len(scores) if scores else 0.5
 					# Wald interval on the mean score; wide at 30 games, which
 					# is worth seeing rather than hiding.
@@ -1222,6 +1351,22 @@ def main():
 					      f"(+/-{ci * 100:.1f})   "
 					      f"Elo {elo_diff(win_rate):+.0f}   "
 					      f"in {time.time() - t0:.0f}s")
+					# The draw rate is what decides whether this match could
+					# have promoted at all: with d decisive games the best
+					# reachable score is (len - d)/2 + d, so a match that comes
+					# back 98% drawn cannot reach --eval-promote however well
+					# the net played.  Print it next to the result so a dead
+					# arena is visible without recounting the game log.
+					decisive = wins + losses_n
+					ceiling = (len(scores) - decisive) * 0.5 + decisive
+					print(f"  Decisive: {decisive}/{len(scores)} "
+					      f"({decisive / len(scores) * 100:.0f}%, "
+					      f"{arena_adjudicated} adjudicated)   "
+					      f"best reachable score "
+					      f"{ceiling / len(scores) * 100:.0f}%"
+					      + ("" if ceiling / len(scores) >= args.eval_promote
+					         else "  <-- BELOW PROMOTION THRESHOLD, "
+					              "arena cannot promote"))
 					if win_rate >= args.eval_promote:
 						_atomic_save(fp16_state_dict(model), ref_weights_path)
 						generation += 1

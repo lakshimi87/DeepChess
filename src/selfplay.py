@@ -15,14 +15,15 @@ CUDA/spawn start-up cost is paid once per run rather than once per iteration.
 Protocol (parent -> worker on ``task_q``):
     ("weights",     path)              reload fp16 weights from *path*
     ("ref_weights", path)              reload the arena opponent's fp16 weights
-    ("play",        game_id)           play one self-play game
+    ("play",        (game_id, resign)) play one self-play game; *resign* is
+                                       the threshold this game runs at
     ("match",       (game_id, white))  current vs reference; *white* is True
                                        when the current net has white
     ("stop",        None)              exit
 
 Replies (worker -> parent on ``result_q``):
     ("ready", rank,    None,     None,   None,  None)
-    ("game",  game_id, examples, result, moves, seconds)
+    ("game",  game_id, examples, result, moves, seconds, audit)
     ("match", game_id, score,    result, moves, seconds)
     ("error", game_id, traceback, None,  None,  None)
 """
@@ -146,6 +147,16 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	bad_turns = {chess.WHITE: 0, chess.BLACK: 0}
 	resigned_by = None
 	adjudicated_win = None
+	# The same criterion, recorded rather than acted on.  In an audit game
+	# adjudication is switched off, so this is the only surviving evidence that
+	# a side was materially lost — and it is what the resignation calibration
+	# scores against, because the game's own *result* cannot do that job: with
+	# both mechanisms off these games end 95% drawn, since a net too weak to
+	# convert grinds a won position to the 50-move rule.  Scoring resignations
+	# against that result measures the conversion failure, not the resignation,
+	# and reports 98% false positives for a net whose evaluations are right.
+	# Material is not the network's opinion, so it breaks that circle.
+	would_adjudicate = None
 	adj_leader = None
 	adj_plies = 0
 
@@ -175,7 +186,7 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 			else:
 				bad_turns[mover] = 0
 
-		if adjudicate_enabled:
+		if adjudicate_material > 0.0 and adjudicate_plies > 0:
 			balance = material_balance(board)
 			leader = None
 			if abs(balance) >= adjudicate_material:
@@ -186,8 +197,11 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 				adj_plies = adj_plies + 1 if leader == adj_leader else 1
 				adj_leader = leader
 				if adj_plies >= adjudicate_plies:
-					adjudicated_win = leader
-					break
+					if would_adjudicate is None:
+						would_adjudicate = leader
+					if adjudicate_enabled:
+						adjudicated_win = leader
+						break
 
 	if resigned_by is not None:
 		winner = not resigned_by
@@ -238,11 +252,121 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 		result = "1-0 A" if winner == chess.WHITE else "0-1 A"
 	else:
 		result = board.result()
-	return examples, result
+
+	# Audit games are the calibration sample: they played to a real finish with
+	# both early-stop mechanisms off, so for each side we know both the root Q
+	# it would have resigned on and whether it actually went on to lose.  A
+	# truncated game has no outcome, so it teaches nothing about false
+	# positives and is dropped rather than counted as "not lost".
+	audit = None
+	if audit_game and not truncated:
+		audit = []
+		for side in (chess.WHITE, chess.BLACK):
+			trigger = resign_trigger_q(
+				[q for _s, _p, turn, q in history if turn == side],
+				resign_plies)
+			if trigger is None:
+				continue
+			by_result = winner is not None and winner != side
+			# Mated, or materially crushed for long enough that the loop would
+			# have scored it a loss had adjudication been on.  Both verdicts
+			# travel so the calibration's choice of ground truth stays visible
+			# in the log rather than being buried in this function.
+			by_material = (would_adjudicate is not None
+			               and would_adjudicate != side)
+			audit.append((trigger, by_result or by_material, by_result))
+	return examples, result, audit
+
+
+def resign_trigger_q(own_turn_qs, resign_plies):
+	"""The most demanding threshold at which *own_turn_qs* still resigns.
+
+	Resignation fires when the mover's own root Q stays at or below the
+	threshold for *resign_plies* consecutive turns of its own.  A window of
+	that many turns therefore fires at every threshold at or above the window's
+	*largest* value, and the side needs only its best window:
+
+	    trigger = min over windows of (max within window)
+
+	The side would have resigned at threshold ``t`` exactly when
+	``trigger <= t``, so one number per side summarises it at every candidate
+	threshold at once — which is what makes calibration a scan rather than a
+	replay.  Returns None when the side never had *resign_plies* turns: that is
+	not a threshold of "never", it is no evidence either way, so those sides
+	stay out of the calibration sample entirely.
+	"""
+	if resign_plies <= 0 or len(own_turn_qs) < resign_plies:
+		return None
+	return min(max(own_turn_qs[i:i + resign_plies])
+	           for i in range(len(own_turn_qs) - resign_plies + 1))
+
+
+def false_positives_at(samples, threshold, by_result=False):
+	"""``(false_positives, would_resign)`` for *threshold* over *samples*.
+
+	*samples* are ``(trigger_q, lost, lost_by_result)`` triples from audit
+	games.  A false positive is a side that would have resigned and then was
+	not in fact lost — the only error resignation can make, and the reason the
+	audit fraction exists.
+
+	*lost* is the operative verdict: mated, outplayed, or materially crushed
+	past the adjudication margin.  *by_result* switches to the strict reading,
+	where only the game's own scoreline counts.  That reading is reported but
+	never calibrated against: audit games run with adjudication off, so a net
+	that cannot convert a won position before the 50-move rule draws almost all
+	of them, and every correct resignation in those games reads as an error.
+	"""
+	idx = 2 if by_result else 1
+	fired = [row[idx] for row in samples if row[0] <= threshold]
+	return sum(1 for lost in fired if not lost), len(fired)
+
+
+def calibrate_resign_threshold(samples, current, fp_target=0.05,
+                               min_resigns=10, floor=-0.99, ceiling=-0.10):
+	"""Loosest resignation threshold whose false-positive rate holds.
+
+	``--resign-threshold`` is an absolute bound on root Q, but root Q is a
+	visit-weighted mean over the root's edges, so its scale rides on the value
+	head's.  When that scale halves the fixed threshold becomes unreachable
+	and resignation stops firing entirely — run8 went from 74% resignations to
+	0% by iteration 15 and stayed there for 85 iterations, with the same
+	dead-lost positions evaluating -0.95 before and -0.44 after.  A threshold
+	re-derived each iteration from the audit games tracks the scale instead of
+	being outlived by it.
+
+	Candidates are the observed trigger values, because those are the only
+	points where the firing set changes.  The loosest candidate that keeps
+	false positives at or under *fp_target* wins: stricter thresholds are
+	always available and always cost decisive labels, so the binding
+	constraint is the error rate, not the yield.
+
+	*samples* are the ``(trigger_q, lost, lost_by_result)`` triples audit games
+	return.  Calibration reads *lost*, the operative verdict — see
+	:func:`false_positives_at` for why the scoreline alone will not do.
+
+	Returns ``(threshold, false_positives, would_resign)``, or None when no
+	candidate clears both bars — too thin a sample to justify moving, or a
+	value head whose confident losses are not confirmed often enough to resign
+	on at any threshold.  Either way the caller keeps the threshold it has,
+	and adjudication goes on supplying the decisive labels.
+	"""
+	if not samples:
+		return None
+	best = None
+	for cand in sorted({row[0] for row in samples}):
+		if not floor <= cand <= ceiling:
+			continue
+		fp, fired = false_positives_at(samples, cand)
+		if fired < min_resigns:
+			continue
+		if fp / fired <= fp_target:
+			# Ascending scan, so the last candidate that passes is the loosest.
+			best = (cand, fp, fired)
+	return best
 
 
 def play_match(mcts_cur, mcts_ref, cur_is_white, max_moves=512,
-               temp_moves=12):
+               temp_moves=12, adjudicate_material=0.0, adjudicate_plies=0):
 	"""Play one arena game between two nets and score it for *mcts_cur*.
 
 	Returns ``(score, result_string, moves)`` where score is 1.0 / 0.5 / 0.0
@@ -252,9 +376,29 @@ def play_match(mcts_cur, mcts_ref, cur_is_white, max_moves=512,
 	generate training data.  Instead the first *temp_moves* plies are sampled at
 	temperature 1.0 so the pair doesn't replay one identical game every time;
 	after that both sides play their argmax move.
+
+	**Adjudication.**  Same rule as :func:`play_game`, and it matters more here
+	than there.  Two nets a few iterations apart play near-symmetrical games:
+	scoring everything short of checkmate as a draw put run8's arena at 195-198
+	draws in 200 games, which caps the achievable score near 50% no matter how
+	the match actually went.  Promotion needs 55% = 110 points, so it could not
+	fire even in principle, and the generation counter sat at 0 for every run
+	after run2.  A material margin decides the games the board never finishes,
+	which is what turns the arena back into a measurement.
+
+	No resignation here.  It reads the mover's root Q, and the two sides run
+	*different* nets whose value heads are on different scales, so one absolute
+	threshold would resign asymmetrically and score the scale gap rather than
+	the playing strength.  Material is measured on the board and is common to
+	both sides, so it cannot favour either net.
 	"""
 	board = chess.Board()
 	moves = 0
+	adjudicate_enabled = adjudicate_material > 0.0 and adjudicate_plies > 0
+	adjudicated_win = None
+	adj_leader = None
+	adj_plies = 0
+
 	while not board.is_game_over() and moves < max_moves:
 		cur_to_move = (board.turn == chess.WHITE) == cur_is_white
 		searcher = mcts_cur if cur_to_move else mcts_ref
@@ -266,14 +410,37 @@ def play_match(mcts_cur, mcts_ref, cur_is_white, max_moves=512,
 		board.push(move)
 		moves += 1
 
-	if board.is_checkmate():
+		if adjudicate_enabled:
+			balance = material_balance(board)
+			leader = None
+			if abs(balance) >= adjudicate_material:
+				leader = chess.WHITE if balance > 0 else chess.BLACK
+			if leader is None:
+				adj_leader, adj_plies = None, 0
+			else:
+				adj_plies = adj_plies + 1 if leader == adj_leader else 1
+				adj_leader = leader
+				if adj_plies >= adjudicate_plies:
+					adjudicated_win = leader
+					break
+
+	if adjudicated_win is not None:
+		white_won = adjudicated_win == chess.WHITE
+		score = 1.0 if white_won == cur_is_white else 0.0
+		# board.result() is "*" here — decided, but not over.  The trailing A
+		# keeps the adjudication rate greppable and separates these from the
+		# games that were actually mated on the board.
+		result = "1-0 A" if white_won else "0-1 A"
+	elif board.is_checkmate():
 		# The side to move has been mated, so the other side won.
 		white_won = board.turn == chess.BLACK
 		score = 1.0 if white_won == cur_is_white else 0.0
+		result = board.result()
 	else:
 		# Draw, or truncated at max_moves — scored as a draw either way.
 		score = 0.5
-	return score, board.result(), moves
+		result = board.result()
+	return score, result, moves
 
 
 def fp16_state_dict(model):
@@ -381,6 +548,8 @@ def _worker(rank, task_q, result_q, cfg):
 				score, result, moves = play_match(
 					mcts_eval, mcts_ref, cur_is_white,
 					max_moves=cfg["max_moves"],
+					adjudicate_material=cfg.get("adjudicate_material", 0.0),
+					adjudicate_plies=cfg.get("adjudicate_plies", 0),
 				)
 				result_q.put(("match", game_id, score, result, moves,
 				              time.perf_counter() - t0))
@@ -390,14 +559,21 @@ def _worker(rank, task_q, result_q, cfg):
 			continue
 
 		if kind == "play":
-			game_id = payload
+			# The threshold rides on the task rather than being broadcast.
+			# Broadcasting means putting one message per worker on a queue they
+			# all pull from, which guarantees the *count* and nothing else: a
+			# worker that finishes early can take two and leave another with
+			# none, and that one then plays a whole iteration at a stale
+			# threshold.  Per-task delivery has no such gap, and it costs a
+			# float per game.
+			game_id, resign_threshold = payload
 			t0 = time.perf_counter()
 			try:
-				examples, result = play_game(
+				examples, result, audit = play_game(
 					mcts,
 					max_moves=cfg["max_moves"],
 					value_discount=cfg["value_discount"],
-					resign_threshold=cfg.get("resign_threshold", 0.0),
+					resign_threshold=resign_threshold,
 					resign_plies=cfg.get("resign_plies", 2),
 					resign_disable_frac=cfg.get("resign_disable_frac", 0.1),
 					search_value_weight=cfg.get("search_value_weight", 0.0),
@@ -405,7 +581,8 @@ def _worker(rank, task_q, result_q, cfg):
 					adjudicate_plies=cfg.get("adjudicate_plies", 0),
 				)
 				result_q.put(("game", game_id, examples, result,
-				              len(examples), time.perf_counter() - t0))
+				              len(examples), time.perf_counter() - t0,
+				              audit))
 			except Exception:
 				result_q.put(("error", game_id, traceback.format_exc(),
 				              None, None, None))
@@ -544,15 +721,27 @@ class SelfPlayPool:
 			yield score, result, moves, secs
 			_dispatch(1)
 
-	def play(self, num_games, stop_early=None):
+	def play(self, num_games, stop_early=None, resign_threshold=None):
 		"""Dispatch *num_games* and yield ``(examples, result, moves, secs)``.
 
 		Results arrive in completion order, not submission order.  When
 		*stop_early* is given and returns True, remaining undispatched games are
 		dropped; games already in flight are still collected so no work is
 		wasted and the queues are left clean for the next iteration.
+
+		Yields ``(examples, result, moves, secs, audit)``.  *audit* is None for
+		ordinary games and a list of ``(trigger_q, lost, lost_by_result)``
+		triples for the ``--resign-disable-frac`` games that played to a
+		finish — the sample :func:`calibrate_resign_threshold` needs.
+
+		*resign_threshold* overrides the configured one for this batch of
+		games.  It travels with each task instead of being broadcast, so a
+		threshold re-derived between iterations reaches every game rather than
+		whichever workers happened to pick the broadcast up.
 		"""
-		pending = list(range(num_games))
+		if resign_threshold is None:
+			resign_threshold = self.cfg.get("resign_threshold", 0.0)
+		pending = [(i, resign_threshold) for i in range(num_games)]
 		# Prime each worker with a couple of games, then top up as results land.
 		# Keeping the queue shallow is what makes stop_early cheap: at most
 		# `2 * num_workers` games are committed at any moment.
@@ -578,8 +767,8 @@ class SelfPlayPool:
 			in_flight -= 1
 			if msg[0] == "error":
 				raise RuntimeError(f"self-play worker error:\n{msg[2]}")
-			_kind, _gid, examples, result, moves, secs = msg
-			yield examples, result, moves, secs
+			_kind, _gid, examples, result, moves, secs, audit = msg
+			yield examples, result, moves, secs, audit
 
 			if stop_early is not None and stop_early():
 				pending.clear()
