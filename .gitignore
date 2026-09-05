@@ -229,3 +229,6 @@ third_party/
 
 # Pidfiles for the unattended pipeline (tools/status.sh).
 .run/
+
+# Ladder / diagnostic result files, written alongside their .log
+logs_*.json

@@ -199,7 +199,15 @@ def target_entropy(loader, limit_batches=20):
 def main():
 	ap = argparse.ArgumentParser(description=__doc__,
 	                             formatter_class=argparse.RawDescriptionHelpFormatter)
-	ap.add_argument("--data-dir", required=True)
+	ap.add_argument("--data-dir", required=True, action="append",
+	                metavar="DIR",
+	                help="Directory of label shards.  Repeatable, and "
+	                     "an expert-iteration corpus is added as a "
+	                     "second directory rather than merged into the "
+	                     "first: the two have different provenance — "
+	                     "human games against the net's own — so "
+	                     "keeping them apart is what lets a round be "
+	                     "dropped from the mix by removing one flag.")
 	ap.add_argument("--out", default=os.path.join(CHECKPOINTS_DIR, "pretrained.pt"))
 	# 16x192 (11.54M) rather than run4's 8x128 (3.07M).  Measured on this
 	# GPU, that is 3.8x the parameters for a 29% drop in MCTS-batch inference
@@ -231,10 +239,11 @@ def main():
 	args = ap.parse_args()
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	paths = sorted(os.path.join(args.data_dir, f)
-	               for f in os.listdir(args.data_dir) if f.endswith(".tsv"))
+	paths = sorted(os.path.join(d, f)
+	               for d in args.data_dir
+	               for f in os.listdir(d) if f.endswith(".tsv"))
 	if not paths:
-		raise SystemExit(f"No label shards in {args.data_dir}")
+		raise SystemExit(f"No label shards in {', '.join(args.data_dir)}")
 
 	print(f"Device      : {device}")
 	print(f"Label shards: {len(paths)}")
