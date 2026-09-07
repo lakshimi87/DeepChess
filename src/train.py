@@ -411,6 +411,11 @@ ANCHOR_HUMAN_WEIGHT = 0.30
 ANCHOR_POLICY_FLOOR = 0.10
 ANCHOR_RESULT_WEIGHT = 0.15
 
+# The probe's sample is drawn with its own fixed seed rather than --seed, so
+# two runs launched with different seeds are still measured on identical rows.
+# A ruler that moves with the run being measured is not a ruler.
+_PROBE_SEED = 20260907
+
 
 def load_anchor_dataset(data_dir, max_rows=0, seed=1234):
 	"""Index the Stockfish-labelled shards for use as a training anchor.
@@ -720,6 +725,29 @@ def main():
 	                    help="Cap on indexed anchor rows (~12 bytes each).  "
 	                         "0 indexes the whole corpus, which is ~1 GB of "
 	                         "resident index for a 70M-row one.")
+	parser.add_argument("--probe-data-dir", type=str, default="",
+	                    help="Stockfish-labelled shards to use as a *stationary* "
+	                         "ruler.  Read only -- these rows never reach a "
+	                         "gradient step, so this works in a pure self-play "
+	                         "run without anchoring it.  The existing held-out "
+	                         "measurement scores each iteration's own fresh "
+	                         "self-play positions, which makes it a ruler whose "
+	                         "distribution moves every iteration: run4's "
+	                         "predict-a-draw baseline wandered over "
+	                         "0.36-0.57 across its 258 iterations, so its "
+	                         "value MSE could not be compared iteration to "
+	                         "iteration at all.  A fixed sample of externally "
+	                         "labelled positions has a baseline that does not "
+	                         "move, which is what makes a slope across "
+	                         "iterations mean something.")
+	parser.add_argument("--probe-rows", type=int, default=8192,
+	                    help="Positions in the stationary probe.  Held resident "
+	                         "as full tuples (~24 KB each: 20x8x8 state plus a "
+	                         "dense 4672 policy target), so 8192 rows cost "
+	                         "~195 MB next to the replay buffer.  The value MSE "
+	                         "on this many rows carries a standard error near "
+	                         "0.006, which resolves the 0.02-0.09 margins run4 "
+	                         "produced against its own moving baseline.")
 	parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINTS_DIR,
 	                    help="Directory for model checkpoints")
 	parser.add_argument("--checkpoint-every", type=int, default=10,
@@ -1021,6 +1049,25 @@ def main():
 		print("Anchor          : off (no --anchor-data-dir).  Every training "
 		      "target is now a function of the net's own output.")
 
+	# ---- stationary probe ----
+	# Loaded with a fixed seed so the sample is the same rows on every
+	# iteration and across runs.  Deliberately separate from the anchor: the
+	# anchor is a training input and changes what the net becomes, while this
+	# is only ever read.  A run can therefore be measured against an external
+	# ruler while staying pure self-play.
+	probe_examples = []
+	if args.probe_data_dir and args.probe_rows > 0:
+		t0 = time.time()
+		probe_ds, n_shards = load_anchor_dataset(
+			args.probe_data_dir, args.probe_rows, seed=_PROBE_SEED)
+		probe_examples = [probe_ds[i] for i in range(len(probe_ds))]
+		del probe_ds
+		probe_vals = np.array([e[2] for e in probe_examples], dtype=np.float32)
+		print(f"Probe           : {len(probe_examples):,} fixed rows from "
+		      f"{n_shards} shard(s), read-only "
+		      f"(loaded in {time.time() - t0:.1f}s)  "
+		      f"draw-baseline {float((probe_vals ** 2).mean()):.4f}")
+
 	# ---- arena reference ----
 	# Established before the first iteration, not on the arena's first firing.
 	# Initialising it there cost a full --eval-every of extra delay before any
@@ -1197,6 +1244,10 @@ def main():
 			# Measure before training, print after, next to the training loss.
 			heldout = evaluate_examples(model, device, iter_examples,
 			                            amp=args.amp)
+			# Same weights, same moment, stationary rows.  Measured before the
+			# update so it sits in the same frame as the held-out numbers above.
+			probe = evaluate_examples(model, device, probe_examples,
+			                          amp=args.amp) if probe_examples else None
 
 			# -- training --
 			# Tie the step budget to the rate of new data, not to the buffer size.
@@ -1266,6 +1317,18 @@ def main():
 				print(f"  Value scale : mean|V| "
 				      f"{heldout['pred_abs_mean']:.4f}  max|V| "
 				      f"{heldout['pred_abs_max']:.4f}")
+			if probe:
+				# The one number in this loop that is comparable across
+				# iterations: same rows, same external labels, fixed baseline.
+				# Read the value MSE against that baseline and the trend across
+				# iterations; the policy CE is against a supervised target this
+				# run never trains on, so treat it as agreement with Stockfish
+				# rather than as a loss the run is trying to minimise.
+				print(f"  Probe (fixed): value MSE {probe['value_loss']:.4f}  "
+				      f"vs baseline {probe['value_baseline']:.4f}  "
+				      f"({probe['value_loss'] - probe['value_baseline']:+.4f})  "
+				      f"policy CE {probe['policy_loss']:.4f}  "
+				      f"mean|V| {probe['pred_abs_mean']:.4f}")
 				# This used to compare pred_abs_max against the threshold,
 				# which is the wrong pair of quantities: pred_abs_max is a max
 				# over raw value-head outputs across the batch, while
