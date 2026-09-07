@@ -32,11 +32,33 @@ search will never look at again, and a one-hot target teaches exactly that.
 Keeping the human move alongside the engine's is what stops the policy from
 collapsing onto a single line -- across the corpus the two disagree often
 enough to leave the net a distribution rather than a lookup table.
+
+Per-corpus targets
+------------------
+``--data-dir`` takes ``DIR:key=value,...`` and the recipe then applies to that
+directory alone -- ``sf-weight``, ``human-weight``, ``policy-floor``,
+``result-weight``, defaulting to the run-wide flag where unset::
+
+    python -m src.pretrain \\
+      --data-dir data/bootstrap/labels_70 \\
+      --data-dir data/expert/labels:human-weight=0,result-weight=0
+
+The played-move column does not mean the same thing in every corpus.  In a
+Lichess shard it is an 1800+ human's move and worth 0.30 of the policy target;
+in an expert-iteration shard it is this net's own move, and training on it is
+the self-imitation the expert round exists to escape.  The same goes for the
+result column, which an unfinished self-play game writes as 0 meaning
+"unknown" rather than "draw".  Setting those to zero run-wide instead strips
+them from the 87M human positions where they were the point -- which is what
+the first expert round did, changing two things in a comparison that could
+only be read as one.
 """
 import argparse
 import os
+import re
 import time
 import zlib
+from collections import namedtuple
 
 import chess
 import numpy as np
@@ -57,6 +79,57 @@ def _wdl_value(w, d, ll):
 	return (w - ll) / total
 
 
+#: One target recipe.  Held per shard rather than per run so that corpora of
+#: different provenance can be mixed without averaging their recipes together.
+Weights = namedtuple("Weights", "sf human floor result")
+
+#: ``--data-dir`` override keys -> Weights fields.  The keys are the long
+#: option names without the dashes, so the override reads like the flag it
+#: replaces for that one directory.
+_WEIGHT_KEYS = {"sf-weight": "sf", "human-weight": "human",
+                "policy-floor": "floor", "result-weight": "result"}
+
+
+def _parse_data_dir(spec, default):
+	"""``DIR`` or ``DIR:key=value,...`` -> ``(dir, Weights)``."""
+	path, sep, rest = spec.partition(":")
+	# A colon is legal in a path, so only read one as a separator when what
+	# follows actually looks like an override list.  The sniff accepts
+	# underscores the keys do not use, so that human_weight= reaches the
+	# error below naming the four real keys rather than being taken for part
+	# of a directory name and failing later as a missing path.
+	if not sep or not re.match(r"[a-z_-]+=", rest):
+		return spec, default
+	fields = default._asdict()
+	for item in rest.split(","):
+		key, eq, value = item.partition("=")
+		if not eq or key not in _WEIGHT_KEYS:
+			raise SystemExit(
+				f"--data-dir {spec}: expected key=value with key in "
+				f"{', '.join(sorted(_WEIGHT_KEYS))}, got {item!r}")
+		try:
+			fields[_WEIGHT_KEYS[key]] = float(value)
+		except ValueError:
+			raise SystemExit(
+				f"--data-dir {spec}: {key}={value!r} is not a number")
+	return path, Weights(**fields)
+
+
+def _weights_array(weights, n_shards):
+	"""Per-shard recipe rows.  A single Weights broadcasts over every shard."""
+	if isinstance(weights, Weights):
+		weights = [weights] * n_shards
+	# float64, not float32: the value blend below is computed at the row's
+	# precision and only cast to float32 on the way out, so a float32 recipe
+	# would round every target a bit differently from the scalar code that
+	# produced every checkpoint in results.md.
+	rows = np.asarray([tuple(w) for w in weights],
+	                  dtype=np.float64).reshape(-1, 4)
+	if len(rows) != n_shards:
+		raise ValueError(f"{len(rows)} weight rows for {n_shards} shards")
+	return rows
+
+
 class LabelledPositions(Dataset):
 	"""Random access over label shards, encoding boards on demand.
 
@@ -66,13 +139,12 @@ class LabelledPositions(Dataset):
 	which turns a storage problem into spare CPU time.
 	"""
 
-	def __init__(self, paths, sf_weight, human_weight, floor,
-	             result_weight, index=None):
+	def __init__(self, paths, weights, index=None):
 		self.paths = paths
-		self.sf_weight = sf_weight
-		self.human_weight = human_weight
-		self.floor = floor
-		self.result_weight = result_weight
+		# Indexed by shard, so a corpus assembled from several directories
+		# carries a different recipe per directory.  Callers with a single
+		# provenance pass one Weights and it broadcasts.
+		self.weights = _weights_array(weights, len(paths))
 		self._fh = {}
 		if index is not None:
 			self.shard_id, self.offset, self.bucket = index
@@ -110,7 +182,15 @@ class LabelledPositions(Dataset):
 		return fh
 
 	def __getitem__(self, i):
-		fh = self._handle(int(self.shard_id[i]))
+		sid = int(self.shard_id[i])
+		# .tolist() rather than indexing: it hands back Python floats, and a
+		# Python float is a weak scalar in NumPy's promotion rules while a
+		# np.float64 is a strong one.  Adding the latter to the float32
+		# policy array would promote the sum to float64 and round the target
+		# a bit differently from the scalar code every checkpoint in
+		# results.md was trained with.
+		sf_weight, human_weight, floor, result_weight = self.weights[sid].tolist()
+		fh = self._handle(sid)
 		fh.seek(int(self.offset[i]))
 		parts = fh.readline().decode().rstrip("\n").split("\t")
 		fen, wdl, sf_best, _cp, _moves, played, result = parts
@@ -121,28 +201,28 @@ class LabelledPositions(Dataset):
 
 		policy = np.zeros(NUM_MOVES, dtype=np.float32)
 		if indices:
-			policy[indices] = self.floor / len(indices)
+			policy[indices] = floor / len(indices)
 		by_uci = {m.uci(): idx for m, idx in zip(legal_moves, indices)}
 		# An unmatched move means the shard and the board disagree, which only
 		# happens on a malformed row; dropping the weight is safer than
 		# guessing an index, and renormalising below keeps the target valid.
 		if (idx := by_uci.get(sf_best)) is not None:
-			policy[idx] += self.sf_weight
+			policy[idx] += sf_weight
 		if (idx := by_uci.get(played)) is not None:
-			policy[idx] += self.human_weight
+			policy[idx] += human_weight
 		total = policy.sum()
 		if total > 0:
 			policy /= total
 
 		w, d, ll = (int(x) for x in wdl.split(","))
 		value = _wdl_value(w, d, ll)
-		if self.result_weight > 0.0:
+		if result_weight > 0.0:
 			# Stored result is white-relative; encode_board is mover-relative.
 			outcome = float(result)
 			if board.turn == chess.BLACK:
 				outcome = -outcome
-			value = ((1.0 - self.result_weight) * value
-			         + self.result_weight * outcome)
+			value = ((1.0 - result_weight) * value
+			         + result_weight * outcome)
 		return state, policy, np.float32(value)
 
 
@@ -200,14 +280,24 @@ def main():
 	ap = argparse.ArgumentParser(description=__doc__,
 	                             formatter_class=argparse.RawDescriptionHelpFormatter)
 	ap.add_argument("--data-dir", required=True, action="append",
-	                metavar="DIR",
+	                metavar="DIR[:key=value,...]",
 	                help="Directory of label shards.  Repeatable, and "
 	                     "an expert-iteration corpus is added as a "
 	                     "second directory rather than merged into the "
 	                     "first: the two have different provenance — "
 	                     "human games against the net's own — so "
 	                     "keeping them apart is what lets a round be "
-	                     "dropped from the mix by removing one flag.")
+	                     "dropped from the mix by removing one flag.  "
+	                     "Append :key=value,... to override the target "
+	                     "recipe for that directory alone (sf-weight, "
+	                     "human-weight, policy-floor, result-weight); "
+	                     "anything unset takes the run-wide flag.  An "
+	                     "expert corpus wants "
+	                     ":human-weight=0,result-weight=0 — its played-move "
+	                     "column is this net's own move and its result "
+	                     "column is 0 for 'unknown' — and setting those "
+	                     "run-wide would strip them from the human corpus "
+	                     "too.")
 	ap.add_argument("--out", default=os.path.join(CHECKPOINTS_DIR, "pretrained.pt"))
 	# 16x192 (11.54M) rather than run4's 8x128 (3.07M).  Measured on this
 	# GPU, that is 3.8x the parameters for a 29% drop in MCTS-batch inference
@@ -239,17 +329,32 @@ def main():
 	args = ap.parse_args()
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	paths = sorted(os.path.join(d, f)
-	               for d in args.data_dir
-	               for f in os.listdir(d) if f.endswith(".tsv"))
+	default_w = Weights(args.sf_weight, args.human_weight,
+	                    args.policy_floor, args.result_weight)
+	specs = [_parse_data_dir(s, default_w) for s in args.data_dir]
+	for d, _w in specs:
+		if not os.path.isdir(d):
+			raise SystemExit(f"--data-dir {d}: not a directory")
+	entries = sorted(((os.path.join(d, f), w)
+	                  for d, w in specs
+	                  for f in os.listdir(d) if f.endswith(".tsv")),
+	                 key=lambda e: e[0])
+	paths = [p for p, _w in entries]
+	shard_w = [w for _p, w in entries]
 	if not paths:
-		raise SystemExit(f"No label shards in {', '.join(args.data_dir)}")
+		raise SystemExit(f"No label shards in {', '.join(d for d, _ in specs)}")
 
 	print(f"Device      : {device}")
 	print(f"Label shards: {len(paths)}")
+	# Print the recipe per corpus rather than only the run-wide flags.  A log
+	# that records the flags cannot show that two corpora were trained on
+	# different targets, which is the confound this whole option exists for.
+	for d, w in specs:
+		n = sum(1 for f in os.listdir(d) if f.endswith(".tsv"))
+		print(f"  {d}  {n} shards  sf {w.sf:.2f}  human {w.human:.2f}  "
+		      f"floor {w.floor:.2f}  result {w.result:.2f}")
 	t0 = time.time()
-	full = LabelledPositions(paths, args.sf_weight, args.human_weight,
-	                         args.policy_floor, args.result_weight)
+	full = LabelledPositions(paths, shard_w)
 	print(f"Positions   : {len(full):,}  (indexed in {time.time()-t0:.1f}s)")
 
 	# Split on a hash of the position, not at random.  Shards come from
@@ -263,8 +368,7 @@ def main():
 	val_idx = np.flatnonzero(is_val)
 	train_idx = np.flatnonzero(~is_val)
 	mk = lambda idx: LabelledPositions(
-		paths, args.sf_weight, args.human_weight, args.policy_floor,
-		args.result_weight,
+		paths, shard_w,
 		index=(full.shard_id[idx], full.offset[idx], full.bucket[idx]))
 	train_ds, val_ds = mk(train_idx), mk(val_idx)
 	print(f"Train/val   : {len(train_ds):,} / {len(val_ds):,}")

@@ -427,14 +427,17 @@ def load_anchor_dataset(data_dir, max_rows=0, seed=1234):
 	Mixing a fraction of them into every training step turns the supervised
 	solution from a starting point into a constraint.
 	"""
-	from .pretrain import LabelledPositions
+	from .pretrain import LabelledPositions, Weights
 
 	paths = sorted(os.path.join(data_dir, f)
 	               for f in os.listdir(data_dir) if f.endswith(".tsv"))
 	if not paths:
 		raise SystemExit(f"No label shards in {data_dir}")
-	ds = LabelledPositions(paths, ANCHOR_SF_WEIGHT, ANCHOR_HUMAN_WEIGHT,
-	                       ANCHOR_POLICY_FLOOR, ANCHOR_RESULT_WEIGHT)
+	# One directory, one provenance: the anchor is always the human corpus,
+	# so a single recipe broadcasts over its shards.
+	anchor_w = Weights(ANCHOR_SF_WEIGHT, ANCHOR_HUMAN_WEIGHT,
+	                   ANCHOR_POLICY_FLOOR, ANCHOR_RESULT_WEIGHT)
+	ds = LabelledPositions(paths, anchor_w)
 	if max_rows and len(ds) > max_rows:
 		# The row index is ~12 bytes/row, so a full 70M-row corpus costs ~1 GB
 		# of resident memory next to a replay buffer that is already the
@@ -444,8 +447,7 @@ def load_anchor_dataset(data_dir, max_rows=0, seed=1234):
 		rng = np.random.default_rng(seed)
 		keep = np.sort(rng.choice(len(ds), size=max_rows, replace=False))
 		ds = LabelledPositions(
-			paths, ANCHOR_SF_WEIGHT, ANCHOR_HUMAN_WEIGHT,
-			ANCHOR_POLICY_FLOOR, ANCHOR_RESULT_WEIGHT,
+			paths, anchor_w,
 			index=(ds.shard_id[keep], ds.offset[keep], ds.bucket[keep]))
 	return ds, len(paths)
 
