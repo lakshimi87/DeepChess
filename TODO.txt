@@ -1,6 +1,13 @@
 DeepChess — 다음 세션 인수인계
-작성 2026-09-07 (J5 판독 완료, run9 진행 중 — 순수 self-play로 회귀)
+작성 2026-09-09 (run9 완주·판독 완료 — 순수 self-play가 학습한다는 첫 유효 측정)
 ================================================================
+
+지금 돌고 있는 것은 없다. run9가 2026-09-08 02:48에 150 iteration을 완주했고
+판독은 0-D3에, 전체 수치는 results.md "순수 self-play 실행 (run9)" 절에 있다.
+한 줄 요약: 순수 self-play는 이 예산에서 학습한다(상수 LR 구간 기울기
++1.20 ± 0.11 점/iter, t=10.9) — 그러나 도달 수준은 364/837로 사전학습 758과
+394점 차이고, 값 헤드는 고정 프로브의 상수 예측기를 150 iteration 내내
+넘지 못했다. 다음 수는 4절 j·k다.
 
 방향이 바뀌었다. expert 코퍼스 트랙(J2/J4/J5)은 라운드당 24시간을 써서
 760 → 768(노이즈 경계)이고, 노린 Endgame은 76 → 75로 움직이지 않았다.
@@ -8,7 +15,7 @@ DeepChess — 다음 세션 인수인계
 사망 선고 자체가 무효였다는 걸 찾았다. 아래 0-A가 그 내용이다.
 
 
-0-A. run4 판결이 무효인 이유 (이번 세션의 핵심 발견)
+0-A. run4 판결이 무효인 이유 (09-07 세션의 핵심 발견, run9로 확인됨)
 ----------------------------------------------------------------
 
 README의 "Self-play from a random initialisation does not converge on one
@@ -72,10 +79,11 @@ GPU. archive/run4_8x128_iter258 run is the evidence" — 이 근거가 셋 다
     이번에 --probe-data-dir 로 막았다 (0-C).
 
 
-0-B. 지금 돌고 있는 것 (setsid, 셸과 무관)
+0-B. run9 실행 조건 (완료 — 재실행/연장 시 그대로 쓸 것)
 ----------------------------------------------------------------
 
 run9  순수 self-play, from scratch — run4 판결의 재심
+      완주 2026-09-08 02:48, 150/150 iteration. 판독은 0-D3.
 
     setsid nohup ./train.sh \
       --from-scratch \
@@ -91,8 +99,8 @@ run9  순수 self-play, from scratch — run4 판결의 재심
       --checkpoint-every 10 \
       > logs_run9.log 2>&1 < /dev/null &
 
-    시작    2026-09-07
-    PID     1530960
+    시작    2026-09-07 15:0x   종료  2026-09-08 02:48 (11.3h)
+    PID     1530960 (종료됨)
     로그    logs_run9.log
     실측    iteration 1 = self-play 378.7s + 학습 5.0s ≈ 385s
             (200게임 18,043수, 게임당 90수 — adjudication이 게임을
@@ -100,9 +108,14 @@ run9  순수 self-play, from scratch — run4 판결의 재심
             + GT 판독 165s가 5 iteration마다
             → 150 iter에 약 18시간. 다만 네트워크가 강해지면 5폰
               차 압승이 줄어 게임이 길어지므로 20~25시간을 보는 게 맞다.
+    실제    11.3h — self-play 10.1h + GT 판독 30회 1.4h + 학습 5분.
+            게임당 수가 90 → 53으로 줄어(adjudication + resignation) 예상
+            18~25h보다 빨랐다.
     확인    grep -vE '^  Game ' logs_run9.log | tail -20
-    살아있는지  ps -p 1530960     (PPID 1, 세션 리더, 제어 터미널 없음)
-    중단        kill 1530960
+    산출물  checkpoints/run9/{latest.pt, best_gt.pt(375 @125),
+            model_iter_0010..0150.pt}
+            ※ run9 dir 안에만 있다. 기본 dir의 latest.pt(사전학습 70M,
+              play.sh와 engine.py가 서비스하는 것)는 안 건드렸다.
 
     플래그를 이렇게 준 이유 (전부 되돌리면 안 되는 것들):
 
@@ -132,7 +145,7 @@ run9  순수 self-play, from scratch — run4 판결의 재심
         뜻한다. README가 경고하는 함정이다.
 
 
-0-C. 이번 세션에 넣은 코드 변경 (아직 커밋 안 됨)
+0-C. 고정 프로브 (커밋 87d8437 — run9가 이 코드로 돌았다)
 ----------------------------------------------------------------
 
 src/train.py — 고정 프로브. 0-A(4)의 구멍을 막는다.
@@ -161,7 +174,7 @@ verdict was never established" — TODO.txt와 함께 들어갔다. run9는 이
     $ git log --oneline --grep="ruler that does not move"
 
 
-0-D. run9를 어떻게 읽을 것인가
+0-D. run9를 어떻게 읽을 것인가 (사전 등록 — 판정은 0-D3)
 ----------------------------------------------------------------
 
 가설: run4의 결손은 예산이 아니라 value 타깃의 57% 0.0 라벨이었다.
@@ -198,6 +211,8 @@ verdict was never established" — TODO.txt와 함께 들어갔다. run9는 이
 
 0-D2. run9 최초 판독 (iteration 0-1) — 1차 가설 통과
 ----------------------------------------------------------------
+※ 진행 중에 쓴 기록이다. 최종 판정은 0-D3이고, 여기 적어둔 세 가지
+  "오해할 수 있는 것"은 셋 다 예상대로 갔다.
 
 iteration 0 (랜덤 초기화 16x192):
 
@@ -252,21 +267,125 @@ iteration 1 (200게임):
     그대로 학습이다.
 
 
+0-D3. run9 최종 판독 — 사전 등록 조건 세 개의 판정
+----------------------------------------------------------------
+
+150/150 완주. 전체 수치·표는 results.md의 "순수 self-play 실행 (run9)"
+절에 넣었다. 여기는 0-D에 미리 적어둔 조건에 대한 판정만 적는다.
+
+(1) draw 비율이 57%에서 안 내려가면 가설 (3) 기각   →  통과
+
+    iteration 1에 11%, 150 iteration 전체가 7~38%(평균 21.4%). run4가 258 iteration
+    동안 못 벗어난 57%를 adjudication이 첫 iteration에 걷어냈다.
+    0-D2(2)에 적어둔 "기물 휴리스틱 라벨" 위험도 해소됐다 — 결정적
+    라벨의 공급원이 adjudication에서 값 헤드 자신으로 넘어갔다:
+
+      iteration     1     5    10    20    50   100   150
+      resign 발동   0%   18%   55%   60%   80%   86%   74%
+      adjudicated  57%   51%   24%   18%    3%    2%   10%
+
+    resign-threshold를 값 헤드 스케일에 맞춰 내려야 하나 걱정했는데
+    (0-D2(2)) 매 iteration 재교정이 알아서 했다 (-0.90 → -0.59).
+
+(2) draw는 내려갔는데 프로브가 평탄하면 라벨이 아니라 예산/용량
+                                                     →  평탄 아님, 그러나 미달
+
+    프로브 value MSE 0.4866(랜덤, ≈베이스라인) → 0.9173(iter 5 최악)
+    → 0.6558(iter 150). 기울기 -0.00112 ± 0.00009 (t=-12.9), 마지막
+    50 iteration만 봐도 -0.00042 ± 0.00010 (t=-4.2)로 끝까지 내려간다.
+    고정 자가 작동한다는 것도 같이 확인됐다 — 베이스라인 0.4865가
+    150 iteration 동안 소수점 넷째 자리까지 안 움직였다.
+
+    그러나 그 베이스라인을 한 번도 넘지 못했다. 끝에서 +0.169이고
+    마지막 기울기가 유지돼도 동률까지 약 400 iteration이 더 걸린다.
+
+    >>> 이 +0.169을 "상수 예측기보다 못하다"로만 읽지 말 것. mean|V|
+        0.55인 네트워크를 무승부 많은 Stockfish 코퍼스에 대고 재는
+        것이라 상당 부분이 출력 스케일 불일치다. 지금 프로브는 스케일과
+        순서(ordering)를 분리하지 못한다 — 그게 4절 k다.
+
+(3) GT 기울기가 iteration 50까지 0과 구분 안 되면 순수 self-play 불가의
+    첫 유효 증거                                     →  해당 없음, 명확히 학습
+
+      iteration   0     5    25    50    75   100   125   150
+      GT 837    206   244   276   303   343   358   375   366
+
+      구간                    판독  기울기(점/iter)      t
+      lr 0.02   iter  5- 95    19   +1.20 ± 0.11      10.9
+      lr 0.02   iter 50- 95    10   +0.79 ± 0.25       3.2
+      lr 0.002  iter 100-130    7   +0.24 ± 0.26       0.9
+      lr 0.0002 iter 135-150    4   +1.28 ± 0.59       2.2
+
+    상수 LR 구간에서 t=10.9, 그 구간 후반만 봐도 t=3.2다. run4의
+    사망 선고는 정식 기각이다 — 그리고 이게 5절 규칙(판독 4개 이상)을
+    지켜서 낸 첫 순수 self-play 기울기다.
+
+수준은 별개 문제다. iteration 100-150 평균 364 ± 7.8 (43.5%)로 사전학습
+70M의 758(91%)과 394점 차다. run4의 8x128이 258 iteration에서 380이었으니
+16x192는 절반 이하 iteration으로 같은 동네에 도달한 것이지 그 위로
+간 것이 아니다. `--eval-every 0`이라 고전 엔진 대전 성적은 없다.
+
+>>> iteration 100 이후의 평탄(iter>=100 기울기 +0.011 ± 0.157, t=0.07)을
+    용량·예산 천장으로 읽지 말 것. --lr-milestones 100 135가 정확히 그
+    지점에서 LR을 10배, 이어서 100배 떨어뜨린다. 평탄과 스케줄이 같은
+    자리에 있어 분리가 안 된다 — J4(배합+코퍼스), run8(SD 0.6 대 7.4)에
+    이어 세 번째 "비교 하나에 변경 둘"이고, 이번엔 실행 전에 플래그로
+    직접 만들어 넣은 것이다. 다음 실행에서 스케줄을 판독 구간 밖으로
+    빼야 한다 (4절 j).
+
+
 0-E. 정리되지 않은 것
 ----------------------------------------------------------------
 
 - README의 두 서술을 고쳐야 한다: (i) run4를 "the evidence"로 든 문단,
   (ii) "held-out value MSE sat at or above the baseline for all 258
-  iterations". 0-A(1)(2)가 근거다. 아직 안 고쳤다.
+  iterations". 0-A(1)(2)가 근거다. 아직 안 고쳤다 — run9가 끝난 지금은
+  대체할 문장도 생겼다(206 바닥, 상수 LR 기울기 +1.20).
+  ※ results.md에는 들어갔다: 첫 표의 run4 행 주석 세 항목 + run9 절.
 - 지난 파일 4c(J1·J3·J4를 README에 기록)도 여전히 미완이다.
 - expert 트랙의 남은 항목(4b 노이즈 격자, 4h 엔드게임 상향가중)은
-  아래 4절에 그대로 살아있다. run9가 끝나면 우선순위를 다시 볼 것.
+  아래 4절에 그대로 살아있다. 우선순위는 j > k > c > f > e 로 본다 —
+  근거는 0-D3다: 순수 self-play가 학습한다는 건 확인됐고 남은 미지는
+  "천장이 어디인가"(j)와 "값 헤드가 실제로 배우고 있는가"(k)다.
   ※ 4b(dirichlet_eps 격자)는 사전학습 prior가 강할 때의 문제였다.
     랜덤 초기화에서는 prior 엔트로피가 높아 탐색이 제 몫을 하므로
     run9에는 해당하지 않는다 — eps 0.25 기본값으로 돈다.
 
 
-1. 이번 세션에 끝난 측정
+0-F. 이번 세션 코드 변경 — --lr 이 재개를 견디게 (커밋 안 됨)
+----------------------------------------------------------------
+
+src/train.py, +37줄. 4절 j를 쓰다 발견한 구멍이다.
+
+증상: 재개 시 optimizer.load_state_dict 가 param_groups의 lr/initial_lr 을,
+scheduler.load_state_dict 가 base_lrs 를 되살린다. 둘 다 --lr 파싱 뒤에
+실행되므로 커맨드라인 값이 조용히 진다 — 실측으로 --lr 0.05 를 주고
+0.02 체크포인트를 얹으면 0.02로 돈다. 로그에는 "Resumed ... lr=0.0200000"
+한 줄만 남아서, 그 줄을 의심하지 않으면 의도한 LR로 돌고 있다고 믿는다.
+
+고친 방식:
+  - args 해석 전에 lr_from_cli = (args.lr is not None) 를 남긴다.
+    --lr 은 원래부터 default=None 센티넬이라 추가 장치가 필요 없었다.
+  - 두 load_state_dict 뒤에서, 플래그가 주어졌을 때만 base rate를 args.lr 로
+    되돌리고 그 iteration의 스케줄 배수를 다시 얹는다
+    (initial_lr, param_groups[lr], scheduler.base_lrs 세 곳).
+  - 값이 실제로 달라질 때만 "Resumed" 다음 줄에 안내를 찍는다.
+  - --lr 을 안 주면 체크포인트 rate를 그대로 쓴다 (종전 동작 유지).
+
+일부러 건드리지 않은 것: --momentum 은 "안 줬음" 센티넬이 없고,
+--weight-decay 는 파라미터 그룹별로 다르다(weight_decay_groups 가 norm·bias를
+decay 0 그룹으로 뺀다). 둘은 재개 시 체크포인트 값을 유지하며, 주석에 적어뒀다.
+
+검증 (2x32 네트워크, 2게임/20sims 미니 실행 5회):
+  A  --lr 0.005 로 재개        → 0.005 로 학습, 안내 줄 출력           OK
+  B  --lr 없이 재개            → 체크포인트 rate 유지, 안내 없음        OK
+  C  --lr 0.005 --lr-milestones 1 로 마일스톤 뒤 재개
+                               → 0.005 x 0.1 = 0.0005                 OK
+  D  --from-scratch, --lr 없음 → sgd 기본 0.02                        OK
+  E  체크포인트와 같은 --lr    → 안내 줄 없음                          OK
+
+
+1. 09-07 세션에 끝난 측정 (J1~J5)
 ----------------------------------------------------------------
 
 J1  sims 래더 (checkpoints/pretrained_70M.pt, logs_sims_ladder.json)
@@ -419,7 +538,83 @@ J2/J4가 노리는 게 이것이고, 이 근거는 J1·J3와 무관하게 성립
 4. 다음 세션에 할 일
 ----------------------------------------------------------------
 
-a. J5 판독. logs_expert_r2.log 끝의 GT 837을 results.md 사전학습 라운드
+우선순위 j > k > c > f > e. j·k가 run9가 남긴 두 미지이고, 나머지는
+expert 트랙에서 넘어온 것으로 순서만 유지한다. a·d는 완료됐다.
+
+j. run9의 평탄이 천장인지 스케줄인지 분리. ★ 최우선
+
+   0-D3의 마지막 >>> 가 이유다. iteration 100에서 LR이 10배 떨어지는
+   것과 GT가 평탄해지는 것이 같은 자리에 있어 어느 쪽인지 모른다.
+   가장 싼 형태는 마지막 상수-LR 체크포인트에서 이어 도는 것이다:
+
+     setsid nohup ./train.sh \
+       --checkpoint-dir checkpoints/run10 \
+       --lr 0.02 --lr-milestones 10000 \
+       --res-blocks 16 --filters 192 \
+       --iterations 90 --games-per-iter 200 --simulations 800 \
+       --buffer-size 400000 \
+       --search-value-weight 0 \
+       --optimizer sgd \
+       --gt-every 5 --gt-sims 200 --gt-abort-drop 0.90 \
+       --eval-every 0 \
+       --probe-data-dir data/bootstrap/labels_70 --probe-rows 8192 \
+       --checkpoint-every 10 \
+       > logs_run10.log 2>&1 < /dev/null &
+
+   출발 체크포인트는 run9의 model_iter_0090.pt다 — LR이 아직 0.02인
+   구간의 마지막 10 단위 스냅샷이고, iteration 100의 감쇠를 겪지 않았다.
+   그대로 복사해 넣으면 된다:
+
+     mkdir -p checkpoints/run10
+     cp checkpoints/run9/model_iter_0090.pt checkpoints/run10/latest.pt
+
+   재개 의미를 실측으로 확인해둔 것 (추측하지 말 것, 세 개 다 검증했다):
+
+     - --lr-milestones 는 재개해도 커맨드라인이 이긴다. 스케줄러가
+       MultiStepLR이 아니라 LambdaLR이고 _lr_scale(train.py:865 의 docstring)이 매 스텝
+       args 를 읽는다. 체크포인트의 scheduler_state_dict 에는 lr_lambdas가
+       [None]으로만 들어가므로 마일스톤 목록이 실려오지 않는다. 그 docstring이
+       "이렇게 쓴 이유가 resume-safe"라고 직접 적어놨다.
+     - --lr 은 그렇지 않았다. 옵티마이저 param_groups의 lr/initial_lr 과
+       스케줄러의 base_lrs 가 복원되면서 커맨드라인을 조용히 덮었다
+       (0.05를 줘도 0.02로 돌았다). 0-F에서 고쳤다 — 이제 --lr 을 주면
+       그 값이 base rate가 되고 안내 줄이 찍힌다. 안 주면 체크포인트의
+       rate를 그대로 쓴다(종전 동작).
+     - --iterations 는 추가량이다 (end_iter = start_iter + args.iterations,
+       train.py:1154). 위 커맨드의 --iterations 90 은 start_iter 90에서
+       iteration 91~180을 도는 것이고 판독은 18개 나온다. iteration 번호가
+       이어지므로 run9의 같은 절대 번호 판독과 바로 맞대볼 수 있고,
+       마일스톤도 절대 번호라 10000이면 안 걸린다.
+
+   ※ 리플레이 버퍼는 저장되지 않는다 (train.py:1024, 매 실행 새 deque).
+     어느 방식으로 이어도 run10은 빈 버퍼에서 시작한다. 첫 몇 iteration의
+     판독이 낮게 나오는 건 그 탓이므로 기울기 구간에서 제외할 것 —
+     400k / (200게임 x 약 55수) ≈ 36 iteration 이 버퍼가 다 차는 시점이다.
+     run9의 판독과 맞대는 것도 그 이후부터가 정직하다.
+
+   판정: 버퍼가 찬 뒤 구간(대략 iteration 130 이후, 판독 10개)에서
+   기울기가 여전히 양수면 run9의 평탄은 스케줄이었고 천장은 아직 안 보인
+   것이다. 0과 구분이 안 되면 그게 이 예산·용량에서의 첫 유효한 천장
+   측정이 된다.
+   ※ 5절 규칙 — 판독 4개(=20 iteration) 미만으로 아무 말도 하지 말 것.
+
+k. 프로브에 스케일 불변 지표 추가 (j와 병행 가능, 코드 30줄 수준)
+
+   0-D3(2)가 이유다. probe MSE 하나로는 "값 헤드가 순서를 배웠는가"와
+   "출력 스케일이 코퍼스와 안 맞는가"가 섞여서 안 갈라진다.
+   evaluate_examples 옆에 프로브 전용으로만 추가할 것:
+     - 부호 일치율 (라벨 != 0 인 행만)
+     - 피어슨 r
+     - 최적 affine 재스케일 후 MSE  min_{a,b} mean((a*V+b - y)^2)
+       = (1 - r^2) * var(y) 이므로 r 하나로 나온다. 로그에는 셋 다.
+   이게 붙으면 run9 체크포인트(model_iter_*.pt 15개)를 오프라인으로
+   다시 훑어 소급 판독이 가능하다 — 재학습 없이 15회 forward다.
+   ※ 프로브는 계측기다. 학습에 절대 넣지 말 것 (앵커와의 구분).
+
+a. [완료] J5 판독 — results.md 첫 표의 expert r2 행 + "expert 코퍼스
+   라운드 (J4/J5)" 절에 기록. Endgame은 76 → 75로 안 올랐고, 판독은
+   "내려갔다"가 아니라 "올랐다는 증거가 없다"다.
+   원래 항목: logs_expert_r2.log 끝의 GT 837을 results.md 사전학습 라운드
    표에 새 행으로 추가. 기준선은 70M 행의 760이고, 이번엔 다른 게
    expert 코퍼스 하나뿐이라 차이가 그대로 그 몫이다. J4 행(756)도 같이
    적되 교란 있음을 명시할 것. Endgame(91점 만점, 70M 76)을 특히 볼 것 —
@@ -438,9 +633,8 @@ c. J1·J3·J4를 README/results.md에 기록. 두 세션 연속 TODO에만 적�
    넘어갔다. 영구 기록으로 옮길 것. 디렉터리별 가중치도 README의
    파이프라인 명령에 반영해야 한다 (현재 --data-dir 예시가 하나뿐).
 
-d. 코드 변경 커밋. src/pretrain.py + src/train.py 의 디렉터리별 타깃
-   배합이 아직 워킹트리에만 있다 — J5는 이 코드로 돌고 있다. 커밋 전에
-   TODO.txt도 같이 들어간다.
+d. [완료] 커밋 58016e0 "Weight the targets per corpus". 고정 프로브는
+   별도로 87d8437에 들어갔다. 워킹트리는 깨끗하다. 원래 항목:
      --data-dir DIR:key=value,... 형태. 키는 sf-weight / human-weight /
      policy-floor / result-weight, 미지정은 전역 플래그를 따른다.
      LabelledPositions(paths, weights) 로 시그니처가 바뀌었고 weights는
@@ -473,9 +667,15 @@ h. J5가 평평하면 다음은 볼륨이 아니라 상향가중이다. 엔드�
      막지 않는다 — 의도한 상향가중인지 실수인지 로그의 코퍼스 표로
      확인할 것.
 
-i. self-play 재시작은 b의 답이 나온 뒤. 재시작한다면 anchor 증량이
-   아니라 (1) dirichlet_eps 인하 또는 sims 증량, (2) adjudication /
-   resignation 수리 — run8이 드러낸 건 그 둘이다.
+i. 사전학습 네트워크를 넘긴 self-play(run5~run8 트랙) 재시작은 b의 답이
+   나온 뒤. 재시작한다면 anchor 증량이 아니라 (1) dirichlet_eps 인하
+   또는 sims 증량, (2) adjudication / resignation 수리 — run8이 드러낸
+   건 그 둘이다.
+   ※ run9에서 (2)는 이미 확인됐다: adjudication이 draw 57%를 걷어내고
+     resignation 재교정이 값 헤드 스케일을 따라간다(0-D3(1)). 그 두
+     장치는 run5~run8 당시보다 나은 상태다.
+   ※ run9(순수 self-play, j로 이어짐)와 이 트랙은 별개 실험이다.
+     둘을 한 실행에 섞으면 또 "비교 하나에 변경 둘"이 된다.
 
 
 5. 노이즈 바닥 (유지 — 세 번 오판한 원인)

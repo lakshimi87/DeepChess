@@ -630,7 +630,10 @@ def main():
 	                         "ends (OneCycle to 1e-5), so carrying it over "
 	                         "unchanged is what turned run5's collapse into a "
 	                         "single-iteration cliff.  Stepped down by "
-	                         "--lr-gamma at each --lr-milestones.")
+	                         "--lr-gamma at each --lr-milestones.  On a resume "
+	                         "this overrides the rate stored in the "
+	                         "checkpoint; omit it to keep training at the "
+	                         "checkpoint's rate.")
 	parser.add_argument("--warmup-iters", type=int, default=0,
 	                    help="Ramp the LR linearly from 1/N to full over the "
 	                         "first N iterations.  Matters most on the first "
@@ -819,6 +822,10 @@ def main():
 	                         "incompatible checkpoints don't block resume.")
 	args = parser.parse_args()
 
+	# Keep "was --lr typed?" before the default fills it in.  A resume restores
+	# the optimiser's own rate, so the flag has to be re-applied deliberately
+	# further down or the checkpoint outvotes it.
+	lr_from_cli = args.lr is not None
 	if args.lr is None:
 		# Resolved here rather than as an argparse default so that "not given"
 		# stays distinguishable: an SGD rate handed to AdamW is not a slightly
@@ -950,10 +957,42 @@ def main():
 				scheduler.load_state_dict(sched_state)
 			except Exception:
 				pass  # milestones may have changed; fall back to fresh schedule
+		# Both restores carry a learning rate of their own -- the optimiser's
+		# param_groups hold "lr"/"initial_lr" and the scheduler's state holds
+		# "base_lrs" -- and both land after --lr has been parsed, so a resume
+		# silently trains at the checkpoint's rate no matter what the command
+		# line said.  The milestone *list* does not have this problem: it lives
+		# in _lr_scale, which reads args every step, which is exactly why that
+		# replaced MultiStepLR.  The rate itself was still being outvoted.
+		#
+		# Re-applying it here makes --lr mean the same thing on a resume as on
+		# a fresh start: the schedule's base rate, with the milestone decay for
+		# the iteration being resumed at still applied on top.
+		lr_override_msg = ""
+		if lr_from_cli:
+			restored_lr = optimizer.param_groups[0]["lr"]
+			scale = _lr_scale(scheduler.last_epoch)
+			for pg in optimizer.param_groups:
+				pg["initial_lr"] = args.lr
+				pg["lr"] = args.lr * scale
+			scheduler.base_lrs = [args.lr] * len(optimizer.param_groups)
+			if abs(restored_lr - args.lr * scale) > 1e-12:
+				lr_override_msg = (
+					f"  --lr {args.lr:g} applied over the checkpoint's "
+					f"{restored_lr:.7f} (schedule multiplier {scale:g} at "
+					f"this iteration)."
+				)
+		# Only the rate is re-applied.  --momentum has no "not given" sentinel,
+		# and --weight-decay is per-parameter-group (weight_decay_groups puts
+		# norms and biases in a zero-decay group), so neither can be pushed
+		# back over the restored groups without knowing which is which.  Both
+		# keep the checkpoint's values on a resume.
 		generation = ckpt.get("generation", 0)
 		print(f"Resumed from iteration {start_iter}  |  "
 		      f"lr={optimizer.param_groups[0]['lr']:.7f}  |  "
 		      f"arena generation {generation}")
+		if lr_override_msg:
+			print(lr_override_msg)
 		if args.lr_milestones and start_iter >= max(args.lr_milestones):
 			# Report the rate actually in the optimizer, not the one the
 			# milestones imply: MultiStepLR decays incrementally, so the live
