@@ -378,7 +378,9 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 			# in the log rather than being buried in this function.
 			by_material = (would_adjudicate is not None
 			               and would_adjudicate != side)
-			audit.append((trigger, by_result or by_material, by_result))
+			# The scale slot is filled by the caller, which sees the whole
+			# iteration's audit rows; one game cannot measure it.
+			audit.append((trigger, by_result or by_material, by_result, None))
 	return examples, result, audit
 
 
@@ -405,10 +407,43 @@ def resign_trigger_q(own_turn_qs, resign_plies):
 	           for i in range(len(own_turn_qs) - resign_plies + 1))
 
 
-def false_positives_at(samples, threshold, by_result=False):
+def sample_scale(audit_rows):
+	"""Median |trigger| over one iteration's audit sides, or None.
+
+	The scale root Q is being measured against, taken from root Q itself
+	rather than from the value head's output on held-out positions: it is the
+	same quantity the threshold is applied to, and it is available exactly
+	where the samples are, which ``mean|V|`` is not — that is computed after
+	the calibration runs.  See :func:`calibrate_resign_threshold` for what it
+	is for.
+	"""
+	qs = sorted(abs(row[0]) for row in audit_rows)
+	if not qs:
+		return None
+	return qs[len(qs) // 2] or None
+
+
+def scaled_triggers(samples, scale_now):
+	"""Trigger values of *samples* restated on the current scale.
+
+	A sample carries the scale that produced it, so ``trigger / scale`` is
+	scale-free and ``* scale_now`` puts it back in the units the live
+	threshold is expressed in.  Samples with no recorded scale (an older
+	checkpoint's, or an iteration whose audit sides were all at zero) pass
+	through unscaled, which is the previous behaviour.
+	"""
+	out = []
+	for row in samples:
+		scale = row[3] if len(row) > 3 else None
+		out.append(row[0] * scale_now / scale
+		           if scale and scale_now else row[0])
+	return out
+
+
+def false_positives_at(samples, threshold, by_result=False, scale_now=None):
 	"""``(false_positives, would_resign)`` for *threshold* over *samples*.
 
-	*samples* are ``(trigger_q, lost, lost_by_result)`` triples from audit
+	*samples* are ``(trigger_q, lost, lost_by_result, scale)`` rows from audit
 	games.  A false positive is a side that would have resigned and then was
 	not in fact lost — the only error resignation can make, and the reason the
 	audit fraction exists.
@@ -419,14 +454,20 @@ def false_positives_at(samples, threshold, by_result=False):
 	never calibrated against: audit games run with adjudication off, so a net
 	that cannot convert a won position before the 50-move rule draws almost all
 	of them, and every correct resignation in those games reads as an error.
+
+	*scale_now* restates every sample on the current scale first — see
+	:func:`calibrate_resign_threshold`.  Without it a rate computed over a
+	multi-iteration window is a rate over mixed units.
 	"""
 	idx = 2 if by_result else 1
-	fired = [row[idx] for row in samples if row[0] <= threshold]
+	keys = scaled_triggers(samples, scale_now)
+	fired = [row[idx] for row, key in zip(samples, keys) if key <= threshold]
 	return sum(1 for lost in fired if not lost), len(fired)
 
 
 def calibrate_resign_threshold(samples, current, fp_target=0.05,
-                               min_resigns=10, floor=-0.99, ceiling=-0.10):
+                               min_resigns=10, floor=-0.99, ceiling=-0.10,
+                               scale_now=None):
 	"""Loosest resignation threshold whose false-positive rate holds.
 
 	``--resign-threshold`` is an absolute bound on root Q, but root Q is a
@@ -438,14 +479,33 @@ def calibrate_resign_threshold(samples, current, fp_target=0.05,
 	re-derived each iteration from the audit games tracks the scale instead of
 	being outlived by it.
 
+	**The sample has to be restated on the current scale for that to work.**
+	Re-deriving it every iteration is not enough on its own, because the
+	window spans ``--resign-calib-window`` iterations and the scale moves
+	within it: a -0.5 trigger recorded when the median |trigger| was 0.98
+	means "not very lost", and the same -0.5 recorded at 0.50 means "dead
+	lost".  Scored against one absolute candidate those two rows contradict
+	each other, and the stale ones win because there are more of them.
+	Measured over six iterations from pretrained_70M with the material label
+	off, that pinned the threshold at -0.84 for the last three while the sides
+	actually being produced sat at -0.66 to -0.47: the log reported an
+	unchanged 3/16 (19%) false positives each time — the same sixteen stale
+	sides — while real resignations fell 85% -> 15% -> 2%.  The loosening was
+	available and safe the whole time (5 of 6 fresh sides at -0.47, one false
+	positive) and the rate could not see it, because a row that does not fire
+	enters neither the numerator nor the denominator.
+
+	So each sample carries the scale that produced it and *scale_now* puts the
+	whole window back into today's units before any rate is computed.
+
 	Candidates are the observed trigger values, because those are the only
 	points where the firing set changes.  The loosest candidate that keeps
 	false positives at or under *fp_target* wins: stricter thresholds are
 	always available and always cost decisive labels, so the binding
 	constraint is the error rate, not the yield.
 
-	*samples* are the ``(trigger_q, lost, lost_by_result)`` triples audit games
-	return.  Calibration reads *lost*, the operative verdict — see
+	*samples* are the ``(trigger_q, lost, lost_by_result, scale)`` rows audit
+	games return.  Calibration reads *lost*, the operative verdict — see
 	:func:`false_positives_at` for why the scoreline alone will not do.
 
 	Returns ``(threshold, false_positives, would_resign)``, or None when no
@@ -457,10 +517,10 @@ def calibrate_resign_threshold(samples, current, fp_target=0.05,
 	if not samples:
 		return None
 	best = None
-	for cand in sorted({row[0] for row in samples}):
+	for cand in sorted(set(scaled_triggers(samples, scale_now))):
 		if not floor <= cand <= ceiling:
 			continue
-		fp, fired = false_positives_at(samples, cand)
+		fp, fired = false_positives_at(samples, cand, scale_now=scale_now)
 		if fired < min_resigns:
 			continue
 		if fp / fired <= fp_target:
