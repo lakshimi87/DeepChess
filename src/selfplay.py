@@ -74,7 +74,7 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
               temp_high=1.0, temp_low=0.1, resign_threshold=0.0,
               resign_plies=2, resign_disable_frac=0.1,
               search_value_weight=0.0, adjudicate_material=0.0,
-              adjudicate_plies=0):
+              adjudicate_plies=0, adjudicate_label=True):
 	"""Play one self-play game with *mcts* and return (examples, result).
 
 	*mcts* is reused across games — :meth:`MCTS.search` builds a fresh root
@@ -140,7 +140,18 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	# false resignation also catches a material lead that was in fact holdable.
 	audit_game = np.random.random() < resign_disable_frac
 	resign_enabled = resign_threshold < 0.0 and not audit_game
-	adjudicate_enabled = (adjudicate_material > 0.0 and adjudicate_plies > 0
+	# The material rule has two jobs and *adjudicate_label* separates them.
+	# As an arbiter it decides, after the fact, whether a side that resigned
+	# was in fact crushed -- that is the ground truth the resignation
+	# calibration scores against, and it is recorded in `would_adjudicate`
+	# below whatever else happens.  As a label source it ends the game and
+	# writes a win, which is a heuristic target rather than a played result.
+	# Switching the margin to 0 used to switch off both at once, which leaves
+	# the calibration scoring against the scoreline alone -- and audit games
+	# run with both early stops off end ~95% drawn, so every resignation then
+	# counts as a false positive and no threshold can qualify.
+	adjudicate_arbiter = adjudicate_material > 0.0 and adjudicate_plies > 0
+	adjudicate_enabled = (adjudicate_arbiter and adjudicate_label
 	                      and not audit_game)
 	# Counted per colour: the root Q alternates POV every ply, so a single
 	# counter would trip on two *different* sides each thinking they are lost.
@@ -186,7 +197,7 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 			else:
 				bad_turns[mover] = 0
 
-		if adjudicate_material > 0.0 and adjudicate_plies > 0:
+		if adjudicate_arbiter:
 			balance = material_balance(board)
 			leader = None
 			if abs(balance) >= adjudicate_material:
@@ -588,6 +599,7 @@ def _worker(rank, task_q, result_q, cfg):
 					search_value_weight=cfg.get("search_value_weight", 0.0),
 					adjudicate_material=cfg.get("adjudicate_material", 0.0),
 					adjudicate_plies=cfg.get("adjudicate_plies", 0),
+					adjudicate_label=cfg.get("adjudicate_label", True),
 				)
 				result_q.put(("game", game_id, examples, result,
 				              len(examples), time.perf_counter() - t0,

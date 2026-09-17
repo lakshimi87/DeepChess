@@ -600,6 +600,24 @@ def main():
 	                         "short enough to stop a decided game grinding to "
 	                         "the 50-move rule and mislabelling every position "
 	                         "in it as a draw.")
+	parser.add_argument("--adjudicate-label", default=True,
+	                    action=argparse.BooleanOptionalAction,
+	                    help="Whether adjudication ends the game and writes a "
+	                         "win, as opposed to only recording its verdict.  "
+	                         "--no-adjudicate-label keeps the margin as the "
+	                         "*arbiter* the resignation calibration scores "
+	                         "against while removing it as a training target, "
+	                         "which is the combination --adjudicate-material 0 "
+	                         "cannot express: setting the margin to 0 also "
+	                         "blinds the arbiter, and since audit games run "
+	                         "with both early stops off and end ~95% drawn, "
+	                         "the calibration then reads ~92% false positives, "
+	                         "no threshold qualifies, and the run keeps the "
+	                         "fixed --resign-threshold for its whole length.  "
+	                         "That is run8's failure mode, and run11's first "
+	                         "attempt reproduced it in three iterations "
+	                         "(resignation 76%% -> 62%% -> 53%%, draws 39%% -> "
+	                         "54%% -> 60%%).")
 	parser.add_argument("--arena-adjudicate-material", type=float, default=-1.0,
 	                    help="Material margin the *arena* adjudicates on, "
 	                         "independent of --adjudicate-material.  Negative "
@@ -886,6 +904,8 @@ def main():
 
 	_sp_adj = _adj_str(args.adjudicate_material, args.adjudicate_plies)
 	_ar_adj = _adj_str(arena_adj_material, arena_adj_plies)
+	if not args.adjudicate_label and _sp_adj != "off":
+		_sp_adj += " (arbiter only — writes no label)"
 	print(f"Adjudication    : self-play {_sp_adj}"
 	      + (f"  |  arena {_ar_adj}" if _ar_adj != _sp_adj
 	         else "  |  arena same"))
@@ -1105,6 +1125,7 @@ def main():
 		"resign_disable_frac": args.resign_disable_frac,
 		"adjudicate_material": args.adjudicate_material,
 		"adjudicate_plies": args.adjudicate_plies,
+		"adjudicate_label": args.adjudicate_label,
 		"arena_adjudicate_material": arena_adj_material,
 		"arena_adjudicate_plies": arena_adj_plies,
 		"fpu_reduction": args.fpu_reduction,
