@@ -1263,6 +1263,7 @@ def main():
 			moves_total = 0
 			resigned = 0
 			tb_ended = 0
+			fifty_move = 0
 			adjudicated = 0
 			truncated = 0
 			t0 = time.time()
@@ -1282,6 +1283,8 @@ def main():
 					adjudicated += 1
 				elif result.endswith(" T"):
 					tb_ended += 1
+				elif result.endswith(" F"):
+					fifty_move += 1
 				elif result == "*":
 					truncated += 1
 				print(f"  Game {done:>{width}}/{args.games_per_iter}  "
@@ -1307,6 +1310,8 @@ def main():
 				      + (f"tablebase {tb_ended}/{done} "
 				         f"({tb_ended / done * 100:.0f}%)  "
 				         if args.syzygy_path else "")
+				      + f"fifty-move draw {fifty_move}/{done} "
+				      f"({fifty_move / done * 100:.0f}%)  "
 				      + f"hit move limit {truncated}/{done} "
 				      f"({truncated / done * 100:.0f}%)")
 

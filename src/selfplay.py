@@ -218,7 +218,21 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	tb_decided = False
 
 	move_count = 0
-	while not board.is_game_over() and move_count < max_moves:
+	# board.is_game_over() defaults to claim_draw=False, so it ends a game on
+	# the seventy-five-move rule and fivefold repetition but not on the fifty
+	# and threefold a player would actually claim.  With repetition banned at
+	# the root fivefold can no longer happen, so that left the game running to
+	# --max-moves and labelling every position in it with root_q -- the net's
+	# own opinion, which is the self-confirming loop this is all trying to get
+	# out of.  Truncation went 13% -> 30% -> 63% over four iterations that way.
+	#
+	# The fifty-move test is added directly rather than via claim_draw=True,
+	# which would also call can_claim_threefold_repetition() every move -- that
+	# is the stack scan profiled at ~30% of per-move CPU.  This is the same
+	# condition _is_terminal_fast already uses, so the search and the game now
+	# agree about when a game is over instead of differing by fifty moves.
+	while (not board.is_game_over() and board.halfmove_clock < 100
+	       and move_count < max_moves):
 		temperature = temp_high if move_count < temp_moves else temp_low
 		state = encode_board(board)
 		move, policy = mcts.search(board, temperature=temperature, add_noise=True)
@@ -291,7 +305,8 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	# rather than being blended with it.
 	truncated = (not tb_decided and resigned_by is None
 	             and adjudicated_win is None
-	             and not board.is_game_over() and move_count >= max_moves)
+	             and not board.is_game_over() and board.halfmove_clock < 100
+	             and move_count >= max_moves)
 
 	examples = []
 	total = len(history)
@@ -331,6 +346,14 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 		# run where only adjudication fires has a dead value head even though
 		# its decisive-label rate looks healthy.
 		result = "1-0 A" if winner == chess.WHITE else "0-1 A"
+	elif board.halfmove_clock >= 100 and not board.is_game_over():
+		# F, because board.result() still answers "*" here: claim_draw is off,
+		# so the strict rules do not call a fifty-move game over and the
+		# caller would count a real draw as a truncation.  It is a draw, and
+		# 0.0 is the right label -- but a run drowning in fifty-move draws is
+		# in a different state from one running out of moves, and one counter
+		# for both hides which.
+		result = "1/2-1/2 F"
 	else:
 		result = board.result()
 
@@ -480,7 +503,11 @@ def play_match(mcts_cur, mcts_ref, cur_is_white, max_moves=512,
 	adj_leader = None
 	adj_plies = 0
 
-	while not board.is_game_over() and moves < max_moves:
+	# Same fifty-move agreement as play_game: a match game that runs to the
+	# move limit scores as a draw either way, but it costs several hundred
+	# plies of search first.
+	while (not board.is_game_over() and board.halfmove_clock < 100
+	       and moves < max_moves):
 		cur_to_move = (board.turn == chess.WHITE) == cur_is_white
 		searcher = mcts_cur if cur_to_move else mcts_ref
 		temperature = 1.0 if moves < temp_moves else 0.0
