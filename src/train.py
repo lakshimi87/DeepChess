@@ -600,6 +600,24 @@ def main():
 	                         "short enough to stop a decided game grinding to "
 	                         "the 50-move rule and mislabelling every position "
 	                         "in it as a draw.")
+	parser.add_argument("--syzygy-path", type=str, default="",
+	                    help="Directory of Syzygy WDL tables.  Empty disables "
+	                         "the probe.  Once the board is down to "
+	                         "--syzygy-pieces men the game ends on the table's "
+	                         "verdict, which is the result rather than an "
+	                         "assertion about it: the material rule scores a "
+	                         "fortress or a wrong-coloured bishop as a win and "
+	                         "a piece sacrificed into a mating net as a loss, "
+	                         "and those are the endgame judgements the net "
+	                         "most needs right.  Unlike resignation and "
+	                         "adjudication the probe also fires in audit "
+	                         "games, because it is not an early stop -- it is "
+	                         "the finish, reached sooner.")
+	parser.add_argument("--syzygy-pieces", type=int, default=5,
+	                    help="Men at or below which the tables are probed.  "
+	                         "Must not exceed what --syzygy-path actually "
+	                         "holds; a missing table reads as 'not in the "
+	                         "tables' and the game plays on.")
 	parser.add_argument("--adjudicate-label", default=True,
 	                    action=argparse.BooleanOptionalAction,
 	                    help="Whether adjudication ends the game and writes a "
@@ -909,6 +927,9 @@ def main():
 	print(f"Adjudication    : self-play {_sp_adj}"
 	      + (f"  |  arena {_ar_adj}" if _ar_adj != _sp_adj
 	         else "  |  arena same"))
+	print("Tablebase       : "
+	      + (f"{args.syzygy_path} at {args.syzygy_pieces} men or fewer "
+	         f"(self-play and audit games)" if args.syzygy_path else "off"))
 	if args.eval_every > 0 and args.eval_games > 0:
 		print(f"Arena           : {args.eval_games} games every "
 		      f"{args.eval_every} iter(s) at {args.eval_sims} sims"
@@ -1126,6 +1147,8 @@ def main():
 		"adjudicate_material": args.adjudicate_material,
 		"adjudicate_plies": args.adjudicate_plies,
 		"adjudicate_label": args.adjudicate_label,
+		"syzygy_path": args.syzygy_path,
+		"tablebase_pieces": args.syzygy_pieces,
 		"arena_adjudicate_material": arena_adj_material,
 		"arena_adjudicate_plies": arena_adj_plies,
 		"fpu_reduction": args.fpu_reduction,
@@ -1239,6 +1262,7 @@ def main():
 			done = 0
 			moves_total = 0
 			resigned = 0
+			tb_ended = 0
 			adjudicated = 0
 			truncated = 0
 			t0 = time.time()
@@ -1256,6 +1280,8 @@ def main():
 					resigned += 1
 				elif result.endswith(" A"):
 					adjudicated += 1
+				elif result.endswith(" T"):
+					tb_ended += 1
 				elif result == "*":
 					truncated += 1
 				print(f"  Game {done:>{width}}/{args.games_per_iter}  "
@@ -1278,7 +1304,10 @@ def main():
 				      f"({resigned / done * 100:.0f}%)  "
 				      f"adjudicated {adjudicated}/{done} "
 				      f"({adjudicated / done * 100:.0f}%)  "
-				      f"hit move limit {truncated}/{done} "
+				      + (f"tablebase {tb_ended}/{done} "
+				         f"({tb_ended / done * 100:.0f}%)  "
+				         if args.syzygy_path else "")
+				      + f"hit move limit {truncated}/{done} "
 				      f"({truncated / done * 100:.0f}%)")
 
 			# -- resignation calibration --

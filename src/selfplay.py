@@ -35,6 +35,7 @@ import time
 import traceback
 
 import chess
+import chess.syzygy
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -70,11 +71,48 @@ def material_balance(board):
 	return total
 
 
+def probe_tablebase(tablebase, board):
+	"""Exact game result for *board* from the side to move, or None.
+
+	Returns 1.0 / 0.0 / -1.0 -- win, draw, loss -- and None when the position
+	is not in the tables or cannot be probed.
+
+	Why this and not the material rule.  Adjudicating on material asserts an
+	outcome the game never reached, so it is a heuristic label: a fortress or a
+	wrong-coloured bishop scores as a win, and a piece sacrificed into a mating
+	net scores as a loss.  Both are exactly the endgame judgements the net most
+	needs to get right, and run8 lost 15 of its 91 Endgame points over 100
+	iterations with that rule supplying half the decisive labels.  A tablebase
+	verdict is not an assertion, it is the result, so it carries no bias to
+	learn.  It is also not the network's own opinion, which is what breaks the
+	self-confirming loop resignation otherwise runs in.
+
+	Cursed wins and blessed losses (WDL +/-1) are wins and losses that the
+	50-move rule turns into draws, so they are reported as draws: the game
+	really would be drawn if it were played on.
+	"""
+	if board.castling_rights:
+		# Syzygy is indexed without castling rights.  Impossible to reach at
+		# five men in practice, but a probe would raise rather than say so.
+		return None
+	try:
+		wdl = tablebase.probe_wdl(board)
+	except (KeyError, ValueError, IndexError, OSError):
+		# A missing table is not an error here -- the loop simply plays on.
+		return None
+	if wdl > 1:
+		return 1.0
+	if wdl < -1:
+		return -1.0
+	return 0.0
+
+
 def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
               temp_high=1.0, temp_low=0.1, resign_threshold=0.0,
               resign_plies=2, resign_disable_frac=0.1,
               search_value_weight=0.0, adjudicate_material=0.0,
-              adjudicate_plies=0, adjudicate_label=True):
+              adjudicate_plies=0, adjudicate_label=True,
+              tablebase=None, tablebase_pieces=5):
 	"""Play one self-play game with *mcts* and return (examples, result).
 
 	*mcts* is reused across games — :meth:`MCTS.search` builds a fresh root
@@ -170,6 +208,14 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	would_adjudicate = None
 	adj_leader = None
 	adj_plies = 0
+	# A tablebase verdict is the game's real result reached early, not an
+	# early stop, so unlike resignation and adjudication it also fires in
+	# audit games.  That makes the calibration sample *better*: an audit game
+	# that walks into a drawn five-man ending now ends a draw instead of
+	# grinding to the 50-move rule, which is the outcome the resigning side's
+	# false positive should be scored against.
+	tb_winner = None
+	tb_decided = False
 
 	move_count = 0
 	while not board.is_game_over() and move_count < max_moves:
@@ -185,6 +231,21 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 		mover = board.turn
 		board.push(move)
 		move_count += 1
+
+		if (tablebase is not None
+				and chess.popcount(board.occupied) <= tablebase_pieces):
+			wdl = probe_tablebase(tablebase, board)
+			if wdl is not None:
+				# wdl is from the POV of the side to move *now*, which is the
+				# side that did not just move.
+				if wdl > 0:
+					tb_winner = board.turn
+				elif wdl < 0:
+					tb_winner = not board.turn
+				else:
+					tb_winner = None
+				tb_decided = True
+				break
 
 		if resign_enabled:
 			# root_q is from the POV of the side that was about to move, i.e.
@@ -214,7 +275,9 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 						adjudicated_win = leader
 						break
 
-	if resigned_by is not None:
+	if tb_decided:
+		winner = tb_winner
+	elif resigned_by is not None:
 		winner = not resigned_by
 	elif adjudicated_win is not None:
 		winner = adjudicated_win
@@ -226,7 +289,8 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 	# A game that ran out of moves is unfinished, not drawn.  Its outcome
 	# label carries no information at all, so the search value replaces it
 	# rather than being blended with it.
-	truncated = (resigned_by is None and adjudicated_win is None
+	truncated = (not tb_decided and resigned_by is None
+	             and adjudicated_win is None
 	             and not board.is_game_over() and move_count >= max_moves)
 
 	examples = []
@@ -252,7 +316,13 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 			         + search_value_weight * root_q)
 		examples.append((state, policy, value))
 
-	if resigned_by is not None:
+	if tb_decided:
+		# T, counted separately from R and A: this one is ground truth, and a
+		# run where it supplies the decisive labels is in a different state
+		# from one leaning on the material rule even at the same rate.
+		result = ("1/2-1/2 T" if winner is None
+		          else "1-0 T" if winner == chess.WHITE else "0-1 T")
+	elif resigned_by is not None:
 		# board.result() is "*" here — the game is decided but not over.
 		# The trailing R keeps the resignation rate greppable in the log.
 		result = "1-0 R" if winner == chess.WHITE else "0-1 R"
@@ -517,6 +587,17 @@ def _worker(rank, task_q, result_q, cfg):
 		mcts_ref = MCTS(ref_model, device, num_simulations=eval_sims,
 		                batch_size=cfg["mcts_batch"],
 		                fpu_reduction=cfg["fpu_reduction"])
+		# One handle per worker: the tables are memory-mapped, so eight workers
+		# on one machine share the page cache rather than eight copies of it.
+		# A path that cannot be opened disables the probe instead of killing
+		# the pool -- the run is then the same run without it, which is a
+		# reading, where a dead pool is nothing.
+		tablebase = None
+		if cfg.get("syzygy_path"):
+			try:
+				tablebase = chess.syzygy.open_tablebase(cfg["syzygy_path"])
+			except Exception:
+				tablebase = None
 		result_q.put(("ready", rank, None, None, None, None))
 	except Exception:
 		result_q.put(("error", -1, traceback.format_exc(), None, None, None))
@@ -600,6 +681,8 @@ def _worker(rank, task_q, result_q, cfg):
 					adjudicate_material=cfg.get("adjudicate_material", 0.0),
 					adjudicate_plies=cfg.get("adjudicate_plies", 0),
 					adjudicate_label=cfg.get("adjudicate_label", True),
+					tablebase=tablebase,
+					tablebase_pieces=cfg.get("tablebase_pieces", 5),
 				)
 				result_q.put(("game", game_id, examples, result,
 				              len(examples), time.perf_counter() - t0,
