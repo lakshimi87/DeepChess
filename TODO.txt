@@ -1,10 +1,44 @@
 DeepChess — 다음 세션 인수인계
-작성 2026-09-17 (run11 중단 — 탐색이 반복수를 못 보고 있었다)
+작성 2026-09-17 (run13 가동 중 — 결과 확인부터 할 것)
 ================================================================
 
->>> 지금 돌고 있는 것: 없다. run11은 2026-09-17 10:35에 기동해 3
+>>> 돌고 있다: run13. 2026-09-17 16:26 기동, 100 iteration, 3~5시간.
+    이 세션은 여기까지 걸어두고 끝났다. **먼저 이것부터 볼 것:**
+
+      python3 tools/conversion_trend.py logs_run13.log
+      python3 tools/resign_dump_report.py logs_run13_resign.jsonl
+      grep -E "Ground truth|Arena|generation" logs_run13.log
+
+    끝났는지: pgrep -f "src.train" (없으면 종료)
+    로그 logs_run13.log / 체크포인트 checkpoints/run13
+    커맨드 전문은 0-J에 있다.
+
+>>> 판독 순서와 기준 (전부 사전 등록, 0-H(4)와 0-J):
+    1. arena vs 얼린 사전학습 네트워크 — 주 지표. iteration 5,10,15...
+       55%를 유의하게 넘으면 "사전학습 위로 올렸다"의 첫 증거.
+       ※ 200판 ±2σ가 ±36 Elo다. 판독 4개 모이기 전에 말하지 말 것.
+    2. conversion_trend 의 UNRESOLVED 열 — 4o의 지표.
+       iteration 1은 4%였다. 기울기가 0과 구분 안 되면 4o는 닫힌다.
+    3. GT 837 — "잊어버렸는가" 보조 지표. 기울기를 run8의
+       −0.324 ± 0.049와 맞댄다. ※ 아래 0-K의 비교 가능성 주의.
+    4. Unresolved 줄 (누가 이기고 있었는가) — **run13에는 안 나온다.**
+       커밋 7f44025가 run13 기동 뒤에 들어갔다. 다음 실행부터 나온다.
+
+>>> 중단 조건 (0-H(5), 미리 정해둔 것): value 타깃 draw가 3 iteration
+    연속 60% 초과, 또는 self-play가 iteration당 10분 초과.
+    --gt-abort-drop 0.10 이 683점 아래에서 자동 중단·복원한다.
+
+>>> 이 세션이 닫은 것: 4m (커밋 1204e8a). 자세한 건 4절 m과
+    results.md "resignation 교정" 절. 한 줄: 임계값의 단위가 아니라
+    교정 창이 다섯 개의 스케일을 함께 채점하던 게 문제였다.
+
+>>> 미결로 남긴 것 두 개: 0-K (daf231a의 비교 가능성 주장이 반만 맞다),
+    그리고 4o는 계측기만 만들어두고 판독은 run13을 기다린다.
+
+(이하 이 세션 전반부의 기록) run11은 2026-09-17 10:35에 기동해 3
     iteration 만에 중단했다(로그 logs_run11_aborted.log, 체크포인트
-    checkpoints/run11). 워킹트리는 깨끗하다.
+    checkpoints/run11). 그 뒤 계기를 고쳐 run13으로 다시 걸었다 —
+    checkpoints/run11 은 고장난 교정으로 돈 3 iteration이므로 쓰지 말 것.
 
 >>> 중단 이후 이 세션이 한 일이 본론이다. 커밋 넷이고 전체 기록은
     results.md "하이브리드 재개 시도 (run11)" 절에, 판독 요약과 다음
@@ -676,6 +710,97 @@ run9/run10은 순수 self-play이고 --eval-every 0이라 arena를 아예 안 �
     여기까지 측정만 하고 수정은 별도 변경으로 남겼다.
 
 
+0-J. run13 — 실행 커맨드와 바뀐 전제 (4n의 실행)
+----------------------------------------------------------------
+
+2026-09-17 16:26 기동. 0-H의 설계와 판독 기준을 그대로 쓴다.
+
+    mkdir -p checkpoints/run13
+    cp checkpoints/pretrained_70M.pt checkpoints/run13/latest.pt
+
+    setsid nohup ./train.sh \
+      --checkpoint-dir checkpoints/run13 \
+      --optimizer adamw --lr 1e-4 --warmup-iters 10 \
+      --res-blocks 16 --filters 192 \
+      --iterations 100 --games-per-iter 200 --simulations 400 \
+      --buffer-size 400000 \
+      --search-value-weight 0.35 \
+      --no-adjudicate-label \
+      --arena-adjudicate-material 5 --arena-adjudicate-plies 20 \
+      --eval-every 5 --eval-games 200 --eval-sims 400 --eval-promote 1.01 \
+      --anchor-data-dir data/bootstrap/labels --anchor-frac 0.5 \
+      --probe-data-dir data/bootstrap/labels_70 --probe-rows 8192 \
+      --gt-every 5 --gt-sims 200 --gt-abort-drop 0.10 \
+      --syzygy-path data/syzygy --syzygy-pieces 5 \
+      --resign-dump logs_run13_resign.jsonl \
+      --checkpoint-every 10 \
+      > logs_run13.log 2>&1 < /dev/null &
+
+run11 1차와 다른 것 넷:
+
+  (1) --adjudicate-material 0 이 아니라 --no-adjudicate-label 이다.
+      중재자를 살려야 resignation 교정이 채점할 ground truth가 있다 (0-I(2)).
+      배너가 "self-play 5 pawns for 20 plies (arbiter only — writes no label)"
+      을 찍으면 제대로 걸린 것이다.
+  (2) 반복 금지(daf231a)와 50수 합의(c56d8da)가 들어가 있다. 게임 길이와
+      종료 분포가 run8과 다르다 — 결정적 종료가 12% → 42%.
+  (3) resignation 교정이 스케일을 따라간다(1204e8a). "resignation이 죽었다"가
+      더 이상 기본 실패 모드가 아니다. 의심되면 logs_run13_resign.jsonl 을
+      tools/resign_dump_report.py 로 읽을 것.
+  (4) Syzygy 켜져 있다. 판독으로 쓰지 말 것 — 0판 발동이 기준선이라
+      움직이는 것 자체가 (2)의 부수 판독이다.
+
+iteration 1 실측 (기준선으로 쓸 것):
+
+    self-play 146.5s (200게임 13,789수)
+    resigned 86%  adjudicated 0%  tablebase 4%  50수 무승부 4%  수 제한 0%
+    value 타깃 win 29% draw 41% loss 30%
+    GT 757/837 at iteration 0
+    root-Q 스케일 0.98, AUC 0.81
+
+  ※ **Syzygy가 발동하기 시작했다.** b9c150d가 "자기대국 180판 중 0판"으로
+    측정하고 "게임이 결판나기 시작하면 probe에 답할 것이 생긴다"고 남긴
+    예측이 확인된 것이다. 반복 금지가 그 조건이었다.
+
+
+0-K. 미결 — daf231a의 비교 가능성 주장이 반만 맞다
+----------------------------------------------------------------
+
+커밋 daf231a가 이렇게 적었다:
+
+    Boards built from a FEN carry no move stack, so nothing is banned and
+    nothing is scored differently.  The 837 suite ... read exactly as before,
+    and stay comparable with run8-run10.
+
+**앞 절반은 맞고 뒤 절반은 틀렸다.** FEN 보드는 repetition_history_keys()가
+빈 frozenset이라 루트 금지가 무력하다. 그런데 하강부가 path_keys 도 들고
+있고(src/mcts.py:400 근처), 이건 **탐색 중인 라인 안의 반복**을 잡는다 —
+수 스택이 필요 없다. 그래서 FEN 루트에서도 라인이 반복되면 값 헤드의 의견
+대신 0으로 종료되고, 선택되는 수가 달라질 수 있다.
+
+징후: 같은 pretrained_70M 을 run11 1차는 759/837, run13은 757/837로 읽었다.
+5절의 재측정 SD 0.6에 대해 2점은 3σ급이다.
+
+확인 중이었다 (이 세션에서 끝나지 않음):
+
+    python3 tools/gt_repetition_ab.py [checkpoint]
+
+같은 체크포인트를 ban_repetition on/off로 559개 move test에 돌려 갈리는 것을
+센다. 중간 판독은 200개 시점에서 on=176 off=177, 차이 2개였다.
+완주 결과는 logs_gt_repetition_ab.log 에 있다 (없으면 위 커맨드로 다시 돌릴 것,
+약 5분).
+
+판정 기준:
+  - 차이 0개면 757 대 759는 측정 노이즈이고, **5절의 "재측정 SD 0.6"이
+    틀린 것이므로 그 숫자를 고쳐야 한다.**
+  - 차이가 있으면 daf231a의 주장을 정정하고, run13의 GT를 run8~run10과
+    맞댈 때 오프셋을 명시해야 한다. GT는 run13의 보조 지표이므로
+    주 판독(arena)은 영향받지 않는다.
+
+※ 어느 쪽이든 results.md와 daf231a를 언급하는 문서를 고칠 것. 이 주장은
+  모든 교차 실행 GT 비교가 딛고 있다.
+
+
 1. 09-07 세션에 끝난 측정 (J1~J5)
 ----------------------------------------------------------------
 
@@ -829,8 +954,9 @@ J2/J4가 노리는 게 이것이고, 이 근거는 J1·J3와 무관하게 성립
 4. 다음 세션에 할 일
 ----------------------------------------------------------------
 
-우선순위 n > o > k > l > c > f > e. m은 커밋 1204e8a로 닫혔다.
-n은 고친 계기로 도는 run11 재기동이고, o는 m이 새로 연 질문이다.
+우선순위 n(진행 중) > K > o > k > l > c > f > e. m은 커밋 1204e8a로
+닫혔다. n은 run13으로 돌고 있으니 판독부터 하고, 0-K가 그 판독의 신뢰도에
+걸리므로 그 다음이다. o는 계측기만 서 있고 판독은 run13이 준다.
 k는 run9가 남긴 나머지 한 미지, l은 천장 판정이 연 질문이다. 나머지는 expert 트랙에서
 넘어온 것으로 순서만 유지한다. a·d·j는 완료됐고, 0-H가 물은 것은
 5b2af16이 닫았다(답은 "아니오" — 0-I(3)).
@@ -890,7 +1016,8 @@ m. [완료 2026-09-17 — 커밋 1204e8a] resignation 교정을 한 스케일 �
      값 헤드가 수축해도 resignation이 살아있으면 성공이다. GT나 arena로
      재지 말 것 — 이 변경은 라벨 공급 장치의 수리이지 강도 변경이 아니다.
 
-n. run11 재기동 (m이 끝났으므로 이제 걸 수 있다).
+n. [진행 중 2026-09-17 16:26 — run13] run11 재기동. 커맨드·기준선·바뀐
+   전제는 0-J. 판독 기준은 0-H(4). 이 세션은 iteration 1까지만 봤다.
 
    0-H의 설계와 판독 기준을 그대로 쓴다 — arena가 iteration 5까지 못 가서
    주 지표를 한 번도 안 읽었으므로 그 절은 아직 미사용이다. 바뀌는 전제
@@ -911,8 +1038,22 @@ n. run11 재기동 (m이 끝났으므로 이제 걸 수 있다).
 
 o. 남은 구속 조건은 전환(conversion)이다. (m이 연 질문)
 
-   m을 고친 뒤에도 iteration 6은 50수 무승부 33% + 수 제한 20%다. 즉 게임의
-   절반 이상이 애초에 결판나지 않는다. resignation은 *이미 진* 쪽에 라벨을
+   ※ 상태 (09-17): 계측기 둘을 세워뒀고 판독은 run13이 준다. 아직
+     **아무것도 판정하지 않았다.**
+       tools/conversion_trend.py   iteration별 미결 비율 + 기울기±SE
+       Unresolved 로그 줄          미결 게임 중 이긴 쪽이 있던 비율
+                                   (커밋 7f44025 — run13에는 안 나온다,
+                                    run13 기동 뒤에 들어갔다)
+   ※ **아래 "33% + 20%"를 그대로 믿지 말 것.** 그 숫자는 값 헤드를 일부러
+     놓아버린 anchor-off 실험(m의 대조군)의 iteration 6이고 run13의 레짐이
+     아니다. run13 iteration 1은 미결 4%(50수 4% + 수 제한 0%)다.
+     m에서 전제를 그대로 받았다가 방향을 잘못 잡을 뻔한 것과 같은 함정이다.
+   ※ 판정 순서: 먼저 conversion_trend 의 기울기가 0과 구분되는지(판독 4개
+     이상). 구분 안 되면 o는 닫힌다. 구분되면 그 다음이 "이긴 쪽이 있었나"
+     이고, 그게 아래 후보 셋 중 어느 것을 고를지 정한다.
+
+   (이하 원래 항목) m을 고친 뒤에도 anchor-off 실험의 iteration 6은 50수
+   무승부 33% + 수 제한 20%다. 즉 게임의 절반 이상이 애초에 결판나지 않는다. resignation은 *이미 진* 쪽에 라벨을
    붙이는 장치이지 게임을 결판내는 장치가 아니므로, 교정을 고친 것으로는
    이 절반이 안 움직인다.
    daf231a(반복수)가 결정적 종료를 12% → 42%로 올렸고 그것이 지금까지 이
