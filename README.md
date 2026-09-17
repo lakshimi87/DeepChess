@@ -299,8 +299,22 @@ mechanism, in order:
    Endgame lost 15 points.  Removing the material label instead does not work
    either: measured over four iterations, the loop collapses to all-draw
    labels.  Both horns are measured; what self-play cannot supply at this
-   strength is an outcome that is informative *and* unbiased.  Making the
-   threshold relative to the value head's scale is the next change.
+   strength is an outcome that is informative *and* unbiased.
+
+   The repair was not where this section expected.  Root Q does *not* follow
+   mean|V| down — it is a visit-weighted mean over a search that finds nothing
+   in a lost position, so it stays extreme while the head's scale halves, and
+   the head keeps ranking a lost side below a holding one (AUC 0.87 -> 0.70
+   over six iterations).  What fails is that the calibration window spans five
+   iterations, the scale moves inside it, and rows recorded at different
+   scales get scored against one absolute candidate — with rows that do not
+   fire counting in neither numerator nor denominator, so the rate freezes on
+   the stale rows that still do.  Each audit row now carries the scale it was
+   measured against and the window is restated in current units before any
+   rate is computed.  The threshold then tracks 0.98 -> 0.49 instead of
+   pinning at -0.84.  What remains is conversion: even with resignation
+   healthy, a third of games end on the fifty-move rule and a fifth run out of
+   moves.
 3. **Blending root Q into a *draw* label contracts the value head.**  For a
    target `(1-w)*z + w*V` the MSE fixed point is `V = z` for any `w`, so on a
    draw (`z = 0`) blending does not escape the constant-0 fixed point — it
