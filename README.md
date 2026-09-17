@@ -225,9 +225,40 @@ own noise:
   to draws was actively harmful.
 - Games cut off at `--max-moves` take the search value outright.  They are
   unfinished, not drawn, and labelling several hundred of their positions 0.0
-  was the largest remaining source of value-label noise.
+  was the largest remaining source of value-label noise.  A game is now far
+  less likely to get there: `play_game` and `play_match` end on the fifty-move
+  rule, the same test MCTS already used in `_is_terminal_fast`, rather than on
+  `is_game_over()`'s default of the seventy-five-move rule.  Those games are
+  a draw (0.0) and are counted on their own line, not as truncations — a run
+  drowning in fifty-move draws is in a different state from one running out
+  of moves.
 - `--adjudicate-material` (default 5 pawns held for `--adjudicate-plies` 20)
-  awards a decided game without consulting the network.
+  awards a decided game without consulting the network.  The margin does two
+  separable jobs, and `--no-adjudicate-label` keeps only the first: it stays
+  the arbiter that scores the resignation calibration's audit games, while no
+  longer writing a result of its own.  Setting the margin to 0 switches off
+  both, and the calibration then has nothing to score against — audit games
+  run with every early stop off end ~95% drawn, so every resignation reads as
+  a false positive and the threshold stays pinned at its default.  The
+  fingerprint in the log is the two numbers on the `Resign calib` line being
+  equal.
+- `--syzygy-path` / `--syzygy-pieces` end a game on a tablebase verdict once
+  the board is down to that many men.  Unlike the two early stops it also
+  fires in audit games: it is not a stop, it is the finish reached sooner.
+  Cursed wins and blessed losses read as draws.  At this strength it fires in
+  0 of 180 self-play games — see `tools/endgame_reach.py`.
+- **MCTS sees repetitions.**  The descent copies the board with
+  `stack=False`, and `_is_terminal_fast` used to skip the repetition scan on
+  the grounds that a missed repetition only affects rare leaves.  Measured, it
+  was 21 of 24 games: a side that believed it was winning repeated the
+  position, the search agreed every time, and the game was drawn at a median
+  of thirteen men.  A move returning to a position already in the game is now
+  struck off at the root (perpetual check exempt; the ban lifts if every legal
+  move repeats), and a repetition met during descent scores 0.  With the same
+  weights, checkmates went from 3 of 24 to 10 of 24.  Cost is a frozenset
+  lookup, not the stack scan that was dropped for being ~30% of per-move CPU.
+  Boards built from a FEN carry no move stack, so positional suites are
+  unaffected and stay comparable with earlier runs.
 
 `--buffer-size` defaults to 1M rather than 200k.  Of every axis in the table
 above, the replay window is the only one that costs RAM instead of GPU time —
@@ -257,6 +288,19 @@ mechanism, in order:
    labelling all of their positions a draw.  `--adjudicate-material` supplies
    decisive labels from material alone, so it keeps working through exactly
    the collapse that silences resignation.
+
+   **This is still open, and it is the binding constraint.**  The threshold is
+   an absolute bound on root Q while root Q's scale rides on the value head's,
+   so recalibrating *which* threshold to use (`8922732`'s fix) cannot help once
+   no threshold is reachable at all: with mean|V| at 0.24, -0.98 is not a
+   bound the search can cross.  run8's resignation died at iteration 15 by the
+   same mechanism, leaving adjudication — "who has more material" — to supply
+   46-56% of decisive labels for the next 85 iterations, which is where
+   Endgame lost 15 points.  Removing the material label instead does not work
+   either: measured over four iterations, the loop collapses to all-draw
+   labels.  Both horns are measured; what self-play cannot supply at this
+   strength is an outcome that is informative *and* unbiased.  Making the
+   threshold relative to the value head's scale is the next change.
 3. **Blending root Q into a *draw* label contracts the value head.**  For a
    target `(1-w)*z + w*V` the MSE fixed point is `V = z` for any `w`, so on a
    draw (`z = 0`) blending does not escape the constant-0 fixed point — it
