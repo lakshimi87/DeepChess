@@ -545,11 +545,20 @@ def _worker(rank, task_q, result_q, cfg):
 			game_id, cur_is_white = payload
 			t0 = time.perf_counter()
 			try:
+				# The arena's adjudication is deliberately a *separate* key.
+				# In play_game the rule is a label source and a heuristic
+				# label is a biased target; here it is a scoring rule, and
+				# without it two near-identical nets return 195-198 draws in
+				# 200 games and promotion cannot fire however the match went.
 				score, result, moves = play_match(
 					mcts_eval, mcts_ref, cur_is_white,
 					max_moves=cfg["max_moves"],
-					adjudicate_material=cfg.get("adjudicate_material", 0.0),
-					adjudicate_plies=cfg.get("adjudicate_plies", 0),
+					adjudicate_material=cfg.get(
+						"arena_adjudicate_material",
+						cfg.get("adjudicate_material", 0.0)),
+					adjudicate_plies=cfg.get(
+						"arena_adjudicate_plies",
+						cfg.get("adjudicate_plies", 0)),
 				)
 				result_q.put(("match", game_id, score, result, moves,
 				              time.perf_counter() - t0))

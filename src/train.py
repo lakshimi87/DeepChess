@@ -600,6 +600,24 @@ def main():
 	                         "short enough to stop a decided game grinding to "
 	                         "the 50-move rule and mislabelling every position "
 	                         "in it as a draw.")
+	parser.add_argument("--arena-adjudicate-material", type=float, default=-1.0,
+	                    help="Material margin the *arena* adjudicates on, "
+	                         "independent of --adjudicate-material.  Negative "
+	                         "means follow --adjudicate-material, which is the "
+	                         "old behaviour.  The two are separate because the "
+	                         "same rule does two different jobs: in self-play "
+	                         "it is a label source, and a heuristic label is a "
+	                         "biased target; in the arena it is a scoring rule "
+	                         "for games the board never finishes, and material "
+	                         "cannot favour either net because it is read off "
+	                         "the board rather than out of a value head.  "
+	                         "Sharing one flag means switching the label "
+	                         "source off also returns the arena to the 195-198 "
+	                         "draws that made promotion impossible in every "
+	                         "run after run2.")
+	parser.add_argument("--arena-adjudicate-plies", type=int, default=-1,
+	                    help="Plies for --arena-adjudicate-material.  Negative "
+	                         "means follow --adjudicate-plies.")
 	parser.add_argument("--batch-size", type=int, default=256,
 	                    help="Training batch size")
 	parser.add_argument("--sample-reuse", type=float, default=3.0,
@@ -848,11 +866,35 @@ def main():
 	print(f"Optimizer       : {args.optimizer}  lr={args.lr:g}"
 	      + (f"  warmup={args.warmup_iters} iter(s)"
 	         if args.warmup_iters > 0 else "  (no warmup)"))
-	print("Adjudication    : "
-	      + (f"{args.adjudicate_material:g} pawns for "
-	         f"{args.adjudicate_plies} plies (self-play and arena)"
-	         if args.adjudicate_material > 0 and args.adjudicate_plies > 0
-	         else "off"))
+	# The arena falls back to the self-play rule unless it is given its own, so
+	# every command line written before the split keeps its exact behaviour.
+	arena_adj_material = (args.adjudicate_material
+	                      if args.arena_adjudicate_material < 0.0
+	                      else args.arena_adjudicate_material)
+	arena_adj_plies = (args.adjudicate_plies
+	                   if args.arena_adjudicate_plies < 0
+	                   else args.arena_adjudicate_plies)
+
+	def _adj_str(material, plies):
+		return (f"{material:g} pawns for {plies} plies"
+		        if material > 0 and plies > 0 else "off")
+
+	# A promotion score above 1.0 is unreachable by construction, which is how
+	# the arena reference is pinned: every match then scores the current net
+	# against the same starting net instead of against a moving target.
+	frozen_ref = args.eval_promote > 1.0
+
+	_sp_adj = _adj_str(args.adjudicate_material, args.adjudicate_plies)
+	_ar_adj = _adj_str(arena_adj_material, arena_adj_plies)
+	print(f"Adjudication    : self-play {_sp_adj}"
+	      + (f"  |  arena {_ar_adj}" if _ar_adj != _sp_adj
+	         else "  |  arena same"))
+	if args.eval_every > 0 and args.eval_games > 0:
+		print(f"Arena           : {args.eval_games} games every "
+		      f"{args.eval_every} iter(s) at {args.eval_sims} sims"
+		      + ("  |  reference FROZEN at the starting net "
+		         "(--eval-promote > 1)" if frozen_ref
+		         else f"  |  promotes at {args.eval_promote * 100:.0f}%"))
 	print("Resignation     : "
 	      + ("off" if args.resign_threshold >= 0.0 else
 	         f"root Q <= {args.resign_threshold:+.2f} for "
@@ -1063,6 +1105,8 @@ def main():
 		"resign_disable_frac": args.resign_disable_frac,
 		"adjudicate_material": args.adjudicate_material,
 		"adjudicate_plies": args.adjudicate_plies,
+		"arena_adjudicate_material": arena_adj_material,
+		"arena_adjudicate_plies": arena_adj_plies,
 		"fpu_reduction": args.fpu_reduction,
 		"dirichlet_alpha": args.dirichlet_alpha,
 		"dirichlet_eps": args.dirichlet_eps,
@@ -1468,7 +1512,9 @@ def main():
 					      f"{arena_adjudicated} adjudicated)   "
 					      f"best reachable score "
 					      f"{ceiling / len(scores) * 100:.0f}%"
-					      + ("" if ceiling / len(scores) >= args.eval_promote
+					      + ("" if (frozen_ref
+					                or ceiling / len(scores)
+					                >= args.eval_promote)
 					         else "  <-- BELOW PROMOTION THRESHOLD, "
 					              "arena cannot promote"))
 					if win_rate >= args.eval_promote:
@@ -1476,6 +1522,15 @@ def main():
 						generation += 1
 						print(f"  Promoted — arena generation "
 						      f"{generation}.")
+					elif frozen_ref:
+						# Not a failed promotion: the reference is pinned on
+						# purpose so every match is scored against the same
+						# net.  A moving reference measures "better than my
+						# recent self", which is what the question here is
+						# not.
+						print(f"  Reference frozen — this is a strength "
+						      f"reading against the iteration-{start_iter} "
+						      f"net, not a promotion test.")
 					else:
 						print(f"  Not promoted (needs "
 						      f"{args.eval_promote * 100:.0f}%) — reference "
