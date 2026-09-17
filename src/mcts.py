@@ -63,6 +63,68 @@ def _is_terminal_fast(board):
 	return False, None
 
 
+def repetition_history_keys(board):
+	"""Transposition keys of every position reachable again from *board*.
+
+	Only positions since the last irreversible move can ever repeat -- a
+	capture or a pawn move resets the halfmove clock and makes everything
+	before it unreachable -- so this walks back that far and no further.  In
+	the middlegame that is a handful of plies, which is why a set lookup
+	replaces ``Board.is_repetition``'s stack scan without costing what the scan
+	cost (~30% of per-move CPU, which is why the scan was dropped).
+
+	The board itself is *not* included: it is the position being searched
+	from, not a position the search could repeat *into*.
+	"""
+	n = min(board.halfmove_clock, len(board.move_stack))
+	if n <= 0:
+		return frozenset()
+	b = board.copy(stack=n)
+	keys = set()
+	for _ in range(n):
+		b.pop()
+		keys.add(b._transposition_key())
+	return frozenset(keys)
+
+
+def repetition_banned_indices(board, legal_moves, history_keys):
+	"""Which of *legal_moves* repeat a position and are forbidden for it.
+
+	A repetition reached by shuffling is not a draw the side *earned*, it is
+	a draw the search cannot see it is walking into: with the move stack
+	dropped during descent nothing can tell a repeated position from a fresh
+	one, so a side that believes it is winning repeats, the search agrees
+	every time, and the game is drawn.  Measured over 24 games from
+	pretrained_70M with every early stop off, 21 ended in threefold repetition
+	at a median of thirteen men (tools/endgame_reach.py).
+
+	Perpetual check is the exception and stays legal.  A repetition that comes
+	out of a check -- given by the move, or escaped by it -- is a real
+	resource, and forbidding it would make the engine play on into a loss
+	where the rules give it a draw.  Those lines keep scoring 0 inside the
+	search, which is what they are worth.
+
+	Returns an empty set when every legal move repeats: a ban with nothing
+	left to play is not a ban, it is a stalemate this function invented.
+	"""
+	if not history_keys or len(legal_moves) < 2:
+		return frozenset()
+	if board.is_check():
+		# Escaping check is forced; whatever it repeats into is not shuffling.
+		return frozenset()
+	banned = set()
+	for i, move in enumerate(legal_moves):
+		board.push(move)
+		repeats = board._transposition_key() in history_keys
+		gives_check = board.is_check()
+		board.pop()
+		if repeats and not gives_check:
+			banned.add(i)
+	if len(banned) == len(legal_moves):
+		return frozenset()
+	return frozenset(banned)
+
+
 class MCTSNode:
 	"""Single node in the MCTS search tree.
 
@@ -102,7 +164,7 @@ class MCTS:
 
 	def __init__(self, model, device, num_simulations=800, c_puct=1.5,
 	             batch_size=1, fpu_reduction=0.25, dirichlet_alpha=0.3,
-	             dirichlet_eps=0.25):
+	             dirichlet_eps=0.25, ban_repetition=True):
 		self.model = model
 		self.device = device
 		self.num_simulations = num_simulations
@@ -113,6 +175,7 @@ class MCTS:
 		self.fpu_reduction = float(fpu_reduction)
 		self.dirichlet_alpha = float(dirichlet_alpha)
 		self.dirichlet_eps = float(dirichlet_eps)
+		self.ban_repetition = bool(ban_repetition)
 		# Root evaluation from the most recent search(), side-to-move POV.
 		# Kept as attributes rather than extra return values so the existing
 		# search() call sites keep their two-value unpacking.  Read straight
@@ -271,6 +334,14 @@ class MCTS:
 
 		*policy_target* is a numpy array (NUM_MOVES,) with the visit-count
 		distribution — used as the training target.
+
+		**Repetition.**  When *ban_repetition* is on (the default) and *board*
+		carries its move stack, a move that walks back into a position already
+		seen is struck off before the search starts, and a repetition met
+		during descent scores 0 instead of whatever the value head thinks.
+		Perpetual check is exempt — see :func:`repetition_banned_indices`.  A
+		board built from a FEN has no stack, so suite scoring and any other
+		positional test is unaffected and stays comparable with past runs.
 		"""
 		self.root_value = self.root_q = 0.0
 
@@ -282,6 +353,14 @@ class MCTS:
 		# Expand root (single NN call — only once per search).
 		policy, root_value = self.evaluate(board)
 		legal_moves, indices = get_legal_move_indices(board)
+
+		history_keys = (repetition_history_keys(board) if self.ban_repetition
+		                else frozenset())
+		banned = repetition_banned_indices(board, legal_moves, history_keys)
+		if banned:
+			legal_moves = [m for i, m in enumerate(legal_moves)
+			               if i not in banned]
+			indices = [x for i, x in enumerate(indices) if i not in banned]
 		# Seed both with the raw net value so the forced-move and zero-visit
 		# fast paths below still leave a meaningful root evaluation behind.
 		self.root_value = self.root_q = float(root_value)
@@ -318,6 +397,11 @@ class MCTS:
 				# which is the only thing the move stack would be needed for.
 				scratch = board.copy(stack=False)
 				path = []
+				# Positions seen on the way down.  The stack is gone, so this
+				# set is the only thing that can tell the descent it has been
+				# here before -- both within one line and against the game's
+				# own history.
+				path_keys = set()
 				term, term_val = _is_terminal_fast(scratch)
 				while not term and node.expanded:
 					idx = self._select_child(node)
@@ -325,6 +409,14 @@ class MCTS:
 					node.total_values[idx] += 1.0  # virtual loss
 					scratch.push(node.moves[idx])
 					path.append((node, idx))
+					if self.ban_repetition:
+						key = scratch._transposition_key()
+						if key in history_keys or key in path_keys:
+							# A draw, from either side, so the sign does not
+							# matter on the way back up.
+							term, term_val = True, 0.0
+							break
+						path_keys.add(key)
 					child = node.children_nodes[idx]
 					if child is None:
 						child = MCTSNode()

@@ -17,27 +17,34 @@ model = ChessNet(num_res_blocks=16, num_filters=192)
 model.load_state_dict(torch.load("checkpoints/pretrained_70M.pt",
                                  map_location="cpu")["model_state_dict"])
 model = perf.to_inference(model, dev, half=True)
-mcts = MCTS(model, dev, num_simulations=SIMS, batch_size=8, dirichlet_eps=0.25)
+mcts = MCTS(model, dev, num_simulations=SIMS, batch_size=8, dirichlet_eps=0.25,
+            ban_repetition="--allow-repetition" not in sys.argv)
 
 reasons, pieces, minpieces, moves_all = collections.Counter(), [], [], []
 for g in range(GAMES):
     b = chess.Board()
     n = 0
     lowest = 32
+    stopped_early = False
     while not b.is_game_over(claim_draw=True) and n < MAX_MOVES:
         mv, _ = mcts.search(b, temperature=1.0 if n < 30 else 0.1, add_noise=True)
         if mv is None:
+            stopped_early = True
             break
         b.push(mv)
         n += 1
         lowest = min(lowest, chess.popcount(b.occupied))
-    if b.is_checkmate():                     r = "checkmate"
-    elif b.is_stalemate():                   r = "stalemate"
-    elif b.is_insufficient_material():       r = "insufficient material"
-    elif b.is_fifty_moves():                 r = "50-move rule"
-    elif b.can_claim_threefold_repetition(): r = "threefold repetition"
-    elif n >= MAX_MOVES:                     r = "move limit"
-    else:                                    r = "other"
+    # outcome() names the termination itself; hand-rolling the elif chain put
+    # ten of twenty-four games in an "other" bucket that meant nothing.
+    oc = b.outcome(claim_draw=True)
+    if oc is not None:
+        r = oc.termination.name.lower().replace("_", " ")
+    elif n >= MAX_MOVES:
+        r = "move limit"
+    elif stopped_early:
+        r = "search returned no move"
+    else:
+        r = "loop exited with game unfinished"
     reasons[r] += 1
     pieces.append(chess.popcount(b.occupied))
     minpieces.append(lowest)
