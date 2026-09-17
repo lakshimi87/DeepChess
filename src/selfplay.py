@@ -353,9 +353,26 @@ def play_game(mcts, max_moves=512, value_discount=1.0, temp_moves=30,
 		# 0.0 is the right label -- but a run drowning in fifty-move draws is
 		# in a different state from one running out of moves, and one counter
 		# for both hides which.
-		result = "1/2-1/2 F"
+		#
+		# Fw when a side held the adjudication margin on the way here and the
+		# game still ended level.  That is the difference between a position
+		# that was drawn and a won position the net could not finish, and only
+		# the second is a conversion failure -- a loop can be at 30% fifty-move
+		# draws and be perfectly healthy if those games really were drawn.
+		# would_adjudicate needs the *arbiter* (--adjudicate-material and
+		# --adjudicate-plies both above 0), not the label: with
+		# --no-adjudicate-label the margin still tracks and this split still
+		# works, which is the configuration run11/run13 use.  At
+		# --adjudicate-material 0 nothing tracks it and every unresolved game
+		# reads as F, which is honest -- there is then no arbiter to say
+		# whether anyone was winning.
+		result = "1/2-1/2 " + ("Fw" if would_adjudicate is not None else "F")
 	else:
 		result = board.result()
+
+	if truncated:
+		# Same split for a game that ran out of moves, and the same reason.
+		result = "*w" if would_adjudicate is not None else "*"
 
 	# Audit games are the calibration sample: they played to a real finish with
 	# both early-stop mechanisms off, so for each side we know both the root Q

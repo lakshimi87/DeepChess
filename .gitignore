@@ -232,3 +232,6 @@ third_party/
 
 # Ladder / diagnostic result files, written alongside their .log
 logs_*.json
+# --resign-dump writes one JSON object per iteration; it is a per-run artifact
+# of the same family, and tools/resign_dump_report.py is what reads it.
+logs_*.jsonl

@@ -1283,6 +1283,12 @@ def main():
 			# statistic over all of them.
 			iter_audit = []
 			resigned = 0
+			# Of the unresolved games, the ones where a side was in fact
+			# winning.  That split is 4o's actual question: 30% fifty-move
+			# draws is a healthy loop if those positions were drawn and a
+			# conversion failure if they were not.
+			fifty_move_won = 0
+			truncated_won = 0
 			tb_ended = 0
 			fifty_move = 0
 			adjudicated = 0
@@ -1298,16 +1304,22 @@ def main():
 				moves_total += moves
 				if audit:
 					iter_audit.extend(audit)
-				if result.endswith(" R"):
+				# Read the trailing token rather than the whole string: the
+				# unresolved endings carry a 'w' when a side held the
+				# adjudication margin and the game still ended level.
+				tag = result.rsplit(" ", 1)[-1] if " " in result else result
+				if tag == "R":
 					resigned += 1
-				elif result.endswith(" A"):
+				elif tag == "A":
 					adjudicated += 1
-				elif result.endswith(" T"):
+				elif tag == "T":
 					tb_ended += 1
-				elif result.endswith(" F"):
+				elif tag in ("F", "Fw"):
 					fifty_move += 1
-				elif result == "*":
+					fifty_move_won += tag == "Fw"
+				elif tag in ("*", "*w"):
 					truncated += 1
+					truncated_won += tag == "*w"
 				print(f"  Game {done:>{width}}/{args.games_per_iter}  "
 				      f"moves={moves:<4} result={result:<7} "
 				      f"{secs:5.1f}s")
@@ -1335,6 +1347,20 @@ def main():
 				      f"({fifty_move / done * 100:.0f}%)  "
 				      + f"hit move limit {truncated}/{done} "
 				      f"({truncated / done * 100:.0f}%)")
+				# 4o's reading, on its own line because it is a different
+				# question from the rates above: of the games the rules never
+				# resolved, how many had a side that was in fact winning.
+				# A loop can sit at 30% fifty-move draws in good health if
+				# those positions were drawn; the same 30% with a winning side
+				# in most of them is a net that cannot finish what it wins.
+				unresolved = fifty_move + truncated
+				if unresolved:
+					won = fifty_move_won + truncated_won
+					print(f"  Unresolved    : {unresolved}/{done} "
+					      f"({unresolved / done * 100:.0f}%) never reached a "
+					      f"result; {won} of them ({won / unresolved * 100:.0f}%) "
+					      f"had a side holding the "
+					      f"{args.adjudicate_material:.0f}-pawn margin")
 
 			# -- resignation calibration --
 			# The threshold is an absolute bound on root Q, and root Q's scale
